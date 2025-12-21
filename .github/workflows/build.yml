@@ -1,4 +1,4 @@
-name: Build Android (APK/AAB) from ZIP
+name: Build Android (APK) from ZIP
 
 on:
   workflow_dispatch:
@@ -71,6 +71,59 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # ---------------- HOTFIXES (NO ZIP REUPLOAD) ----------------
+      - name: Hotfix - patch Dart compile errors
+        shell: bash
+        working-directory: ${{ steps.root.outputs.root }}
+        run: |
+          set -e
+          python3 - <<'PY'
+          import pathlib
+
+          def patch_file(path, repls):
+            p = pathlib.Path(path)
+            if not p.exists():
+              print("Skip (missing):", path)
+              return
+            txt = p.read_text(encoding="utf-8", errors="replace")
+            original = txt
+            for a,b in repls:
+              txt = txt.replace(a,b)
+            if txt != original:
+              p.write_text(txt, encoding="utf-8")
+              print("Patched:", path)
+            else:
+              print("No change:", path)
+
+          # 1) Fix broken quotes in error_lab_engine.dart
+          patch_file("lib/src/services/error_lab_engine.dart", [
+            ("'این خطا معمولاً از کوتیشن‌های شکسته یا متن چندخطی داخل '...'.',",
+             "\"این خطا معمولاً از کوتیشن‌های شکسته یا متن چندخطی داخل '...'.\","),
+            ("'در Dart برای متن چندخطی از \"\"\" استفاده کن، نه '...'.',",
+             "\"در Dart برای متن چندخطی از \\\"\\\"\\\" استفاده کن، نه '...'.\","),
+          ])
+
+          # 2) Fix context name collision in prompt_builder_page.dart
+          p = pathlib.Path("lib/src/features/tools/prompt_builder_page.dart")
+          if p.exists():
+            txt = p.read_text(encoding="utf-8", errors="replace")
+            txt = txt.replace("final context = TextEditingController", "final userContext = TextEditingController")
+            txt = txt.replace("${context.text}", "${userContext.text}")
+            txt = txt.replace("context.dispose()", "userContext.dispose()")
+            txt = txt.replace("Widget build(BuildContext context)", "Widget build(BuildContext ctx)")
+            txt = txt.replace("ScaffoldMessenger.of(context)", "ScaffoldMessenger.of(ctx)")
+            txt = txt.replace("_field('کانتکست', context", "_field('کانتکست', userContext")
+            p.write_text(txt, encoding="utf-8")
+            print("Patched:", p)
+
+          # 3) Fix num->double in dashboard_page.dart
+          patch_file("lib/src/features/dashboard/dashboard_page.dart", [
+            ("final pct = totalLessons == 0 ? 0 : (completedCount / totalLessons);",
+             "final pct = totalLessons == 0 ? 0.0 : (completedCount / totalLessons);"),
+          ])
+          PY
+      # ------------------------------------------------------------
+
       - name: Ensure Android folder exists
         working-directory: ${{ steps.root.outputs.root }}
         run: |
@@ -82,94 +135,25 @@ jobs:
         working-directory: ${{ steps.root.outputs.root }}
         run: flutter pub get
 
-      - name: Build APK (debug, verbose) + save log
-        id: buildapk
+      - name: Analyze (non-fatal)
+        working-directory: ${{ steps.root.outputs.root }}
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
+
+      - name: Build APK (debug)
         working-directory: ${{ steps.root.outputs.root }}
         shell: bash
         run: |
           set -o pipefail
-          flutter doctor -v || true
-          flutter build apk --debug -v 2>&1 | tee flutter_build.log
+          flutter build apk --debug 2>&1 | tee flutter_build.log
 
-      - name: Extract REAL error cause -> ERROR_SUMMARY.txt
-        if: always()
-        working-directory: ${{ steps.root.outputs.root }}
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import re, pathlib
-
-          log = pathlib.Path("flutter_build.log")
-          out = pathlib.Path("ERROR_SUMMARY.txt")
-
-          if not log.exists():
-            out.write_text("flutter_build.log not found.\n", encoding="utf-8")
-            print("No flutter_build.log found.")
-            raise SystemExit(0)
-
-          text = log.read_text(encoding="utf-8", errors="replace")
-          lines = text.splitlines()
-
-          # Root-cause patterns (most useful first)
-          keys = [
-            r"Target of URI doesn't exist",
-            r"Unable to load asset",
-            r"Font asset",
-            r"pubspec\.yaml",
-            r"The method .+ isn't defined",
-            r"Undefined name",
-            r"Unhandled exception",
-            r"Exception:",
-            r"Error:",
-            r"A problem occurred",
-            r"FAILURE: Build failed",
-            r"Could not resolve",
-          ]
-
-          idx = None
-          key_hit = None
-          for k in keys:
-            rx = re.compile(k, re.IGNORECASE)
-            for i, line in enumerate(lines):
-              if rx.search(line):
-                idx = i
-                key_hit = k
-                break
-            if idx is not None:
-              break
-
-          if idx is None:
-            # fallback: last 250 lines
-            snippet = lines[-250:]
-            out.write_text("No pattern matched. Showing last 250 lines:\n\n" + "\n".join(snippet), encoding="utf-8")
-          else:
-            start = max(0, idx - 60)
-            end = min(len(lines), idx + 120)
-            snippet = lines[start:end]
-            out.write_text(
-              f"Matched pattern: {key_hit}\n"
-              f"Showing 60 lines before and 120 lines after:\n\n" +
-              "\n".join(snippet),
-              encoding="utf-8"
-            )
-
-          print("Wrote ERROR_SUMMARY.txt")
-          PY
-
-      - name: Collect artifacts (APK + logs)
+      - name: Collect artifacts (APK + log)
         if: always()
         shell: bash
         run: |
           mkdir -p artifacts
           ROOT="${{ steps.root.outputs.root }}"
-
-          # APK/AAB if produced
-          find "$ROOT/build" -type f \( -name "*.apk" -o -name "*.aab" \) -print -exec cp {} artifacts/ \; || true
-
-          # Logs
+          find "$ROOT/build" -type f -name "*.apk" -print -exec cp {} artifacts/ \; || true
           [ -f "$ROOT/flutter_build.log" ] && cp "$ROOT/flutter_build.log" artifacts/ || true
-          [ -f "$ROOT/ERROR_SUMMARY.txt" ] && cp "$ROOT/ERROR_SUMMARY.txt" artifacts/ || true
-
           ls -la artifacts || true
 
       - name: Upload artifacts
