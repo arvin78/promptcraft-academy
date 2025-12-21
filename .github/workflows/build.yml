@@ -1,22 +1,154 @@
-- name: Hotfix (auto-patch Dart quotes)
+name: Build Android (APK/AAB) from ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "**/*.zip"
+      - ".github/workflows/**"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install unzip
+        run: sudo apt-get update && sudo apt-get install -y unzip
+
+      - name: Pick best ZIP
+        id: pick
         shell: bash
-        env:
-          ROOT: ${{ steps.root.outputs.root }}
         run: |
           set -e
-          FILE="$ROOT/lib/src/services/error_lab_engine.dart"
-          echo "Patching: $FILE"
+          echo "ZIP files found:"
+          find . -maxdepth 3 -type f -iname '*.zip' -print -exec ls -lh {} \; || true
+
+          ZIP="$(find . -maxdepth 3 -type f -iname '*promptcraft*.zip' | head -n 1)"
+          if [ -z "$ZIP" ]; then
+            ZIP="$(find . -maxdepth 3 -type f -iname '*.zip' | head -n 1)"
+          fi
+
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: No .zip file found."
+            exit 1
+          fi
+
+          echo "Chosen ZIP: $ZIP"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Copy ZIP to safe name
+        shell: bash
+        run: |
+          rm -f source.zip
+          cp "${{ steps.pick.outputs.zip }}" source.zip
+          ls -lh source.zip
+
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q source.zip -d extracted
+          echo "Extracted top-level:"
+          ls -la extracted
+
+      - name: Find Flutter project root (pubspec.yaml)
+        id: root
+        shell: bash
+        run: |
+          set -e
+          if [ -f "extracted/pubspec.yaml" ]; then
+            ROOT="extracted"
+          else
+            PUBSPEC="$(find extracted -maxdepth 6 -name pubspec.yaml -print -quit)"
+            if [ -z "$PUBSPEC" ]; then
+              echo "ERROR: pubspec.yaml not found after unzip."
+              exit 1
+            fi
+            ROOT="$(dirname "$PUBSPEC")"
+          fi
+          echo "Using project root: $ROOT"
+          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Hotfix (auto-patch Dart quotes)
+        shell: bash
+        env:
+          FILE: ${{ steps.root.outputs.root }}/lib/src/services/error_lab_engine.dart
+        run: |
+          set -e
+          echo "Hotfix target: $FILE"
+          if [ ! -f "$FILE" ]; then
+            echo "Hotfix skipped: file not found."
+            exit 0
+          fi
           python3 - <<'PY'
           import os, pathlib
           p = pathlib.Path(os.environ["FILE"])
           txt = p.read_text(encoding="utf-8")
 
-          # Fix broken quotes inside single-quoted Dart strings:
-          txt = txt.replace("داخل '...'.", "داخل \\'...\\'.")
-          txt = txt.replace("نه '...'.", "نه \\'...\\'.")
+          # Safe fix: if the string "'...'" exists inside single-quoted Dart strings, escape it
+          txt = txt.replace("'...'", "\\'...\\'")
 
           p.write_text(txt, encoding="utf-8")
-          print("OK patched", p)
+          print("OK patched:", p)
           PY
-        env:
-          FILE: ${{ steps.root.outputs.root }}/lib/src/services/error_lab_engine.dart
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Flutter pub get
+        working-directory: ${{ steps.root.outputs.root }}
+        run: flutter pub get
+
+      - name: Analyze (non-fatal)
+        working-directory: ${{ steps.root.outputs.root }}
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
+
+      - name: Tests (non-fatal)
+        working-directory: ${{ steps.root.outputs.root }}
+        run: flutter test || true
+
+      - name: Ensure Android folder exists
+        working-directory: ${{ steps.root.outputs.root }}
+        run: |
+          if [ ! -d "android" ]; then
+            flutter create --platforms android .
+          fi
+
+      - name: Build APK (verbose, debug)
+        working-directory: ${{ steps.root.outputs.root }}
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter build apk --debug -v 2>&1 | tee flutter_build.log
+
+      - name: Collect artifacts (APK/AAB)
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          ROOT="${{ steps.root.outputs.root }}"
+          find "$ROOT/build" -type f \( -name "*.apk" -o -name "*.aab" \) -print -exec cp {} artifacts/ \; || true
+          # also collect log
+          if [ -f "$ROOT/flutter_build.log" ]; then cp "$ROOT/flutter_build.log" artifacts/; fi
+          echo "Artifacts collected:"
+          ls -la artifacts || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: artifacts/* 
