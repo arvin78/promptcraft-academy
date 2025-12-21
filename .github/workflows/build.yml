@@ -1,4 +1,4 @@
-name: Build Android (RELEASE APK + AAB) from ZIP
+name: Build Android (Release APKs for v8a) from ZIP
 
 on:
   workflow_dispatch:
@@ -20,25 +20,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unzip python3
 
-      - name: Pick ZIP
+      - name: Pick ZIP (any name)
         id: pick
         shell: bash
         run: |
           set -e
           ZIP="$(find . -maxdepth 3 -type f -iname '*.zip' | head -n 1)"
           if [ -z "$ZIP" ]; then
-            echo "ERROR: No .zip found."
+            echo "ERROR: No .zip found in repo."
             exit 1
           fi
           echo "Chosen ZIP: $ZIP"
           echo "zip=$ZIP" >> $GITHUB_OUTPUT
+
+      - name: Copy ZIP to safe name (avoid spaces/parentheses issues)
+        shell: bash
+        run: |
+          rm -f source.zip
+          cp "${{ steps.pick.outputs.zip }}" source.zip
+          ls -lh source.zip
 
       - name: Extract ZIP
         shell: bash
         run: |
           rm -rf extracted
           mkdir -p extracted
-          unzip -q "${{ steps.pick.outputs.zip }}" -d extracted
+          unzip -q source.zip -d extracted
+          echo "Extracted:"
+          ls -la extracted
 
       - name: Find Flutter root (pubspec.yaml)
         id: root
@@ -50,13 +59,13 @@ jobs:
           else
             PUBSPEC="$(find extracted -maxdepth 6 -name pubspec.yaml -print -quit)"
             if [ -z "$PUBSPEC" ]; then
-              echo "ERROR: pubspec.yaml not found."
+              echo "ERROR: pubspec.yaml not found after unzip."
               exit 1
             fi
             ROOT="$(dirname "$PUBSPEC")"
           fi
-          echo "root=$ROOT" >> $GITHUB_OUTPUT
           echo "Using ROOT=$ROOT"
+          echo "root=$ROOT" >> $GITHUB_OUTPUT
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -77,6 +86,73 @@ jobs:
             flutter create --platforms android .
           fi
 
+      # ✅ Hotfixes (NO ZIP reupload) — fix Dart compile errors seen in your logs
+      - name: Hotfix Dart files (auto)
+        working-directory: ${{ steps.root.outputs.root }}
+        shell: bash
+        run: |
+          set -e
+          python3 - <<'PY'
+          import pathlib, re
+
+          def patch(path, fn):
+            p = pathlib.Path(path)
+            if not p.exists():
+              print("Skip missing:", path)
+              return
+            t = p.read_text(encoding="utf-8", errors="replace")
+            t2 = fn(t)
+            if t2 != t:
+              p.write_text(t2, encoding="utf-8")
+              print("Patched:", path)
+            else:
+              print("No change:", path)
+
+          # 1) Fix broken quotes in error_lab_engine.dart
+          def fix_error_lab(t: str) -> str:
+            # simplest safe fix: escape "'...'" anywhere
+            t = t.replace("'...'", "\\'...\\'")
+            # also convert the two known problematic lines into double-quoted strings if present
+            t = t.replace(
+              "'این خطا معمولاً از کوتیشن‌های شکسته یا متن چندخطی داخل \\'...\\'.',",
+              "\"این خطا معمولاً از کوتیشن‌های شکسته یا متن چندخطی داخل '...'.\","
+            )
+            t = t.replace(
+              "'در Dart برای متن چندخطی از \"\"\" استفاده کن، نه \\'...\\'.',",
+              "\"در Dart برای متن چندخطی از \\\"\\\"\\\" استفاده کن، نه '...'.\","
+            )
+            return t
+
+          patch("lib/src/services/error_lab_engine.dart", fix_error_lab)
+
+          # 2) Fix prompt_builder_page.dart: controller named 'context' conflicts with BuildContext
+          def fix_prompt_builder(t: str) -> str:
+            # rename controller variable to ctxController
+            t = re.sub(r"\bfinal\s+context\s*=\s*TextEditingController\b", "final ctxController = TextEditingController", t)
+            t = re.sub(r"\blate\s+final\s+context\s*=\s*TextEditingController\b", "late final ctxController = TextEditingController", t)
+
+            # replace controller usages ONLY in controller context places
+            t = t.replace("context.text", "ctxController.text")
+            t = t.replace("context.dispose()", "ctxController.dispose()")
+            t = t.replace("_field('کانتکست', context", "_field('کانتکست', ctxController")
+            t = t.replace('_field("کانتکست", context', '_field("کانتکست", ctxController')
+
+            # ensure build signature uses BuildContext context (not ctx)
+            t = re.sub(r"Widget\s+build\s*\(\s*BuildContext\s+\w+\s*\)", "Widget build(BuildContext context)", t)
+
+            return t
+
+          patch("lib/src/features/tools/prompt_builder_page.dart", fix_prompt_builder)
+
+          # 3) Fix dashboard num->double (0 -> 0.0)
+          def fix_dashboard(t: str) -> str:
+            # make ternary return double
+            t = re.sub(r"(totalLessons\s*==\s*0\s*\?\s*)0(\s*:\s*)", r"\g<1>0.0\g<2>", t)
+            return t
+
+          patch("lib/src/features/dashboard/dashboard_page.dart", fix_dashboard)
+          PY
+
       - name: Pub get
         working-directory: ${{ steps.root.outputs.root }}
         run: flutter pub get
@@ -89,20 +165,13 @@ jobs:
           flutter build apk --release --split-per-abi 2>&1 | tee flutter_build.log
           flutter build apk --release 2>&1 | tee -a flutter_build.log
 
-      - name: Build RELEASE AAB (Play Store)
-        working-directory: ${{ steps.root.outputs.root }}
-        shell: bash
-        run: |
-          set -o pipefail
-          flutter build appbundle --release 2>&1 | tee -a flutter_build.log
-
-      - name: Collect artifacts (APKs + AAB + log)
+      - name: Collect artifacts (APKs + log)
         if: always()
         shell: bash
         run: |
           mkdir -p artifacts
           ROOT="${{ steps.root.outputs.root }}"
-          find "$ROOT/build" -type f \( -name "*.apk" -o -name "*.aab" \) -print -exec cp {} artifacts/ \; || true
+          find "$ROOT/build" -type f -name "*.apk" -print -exec cp {} artifacts/ \; || true
           [ -f "$ROOT/flutter_build.log" ] && cp "$ROOT/flutter_build.log" artifacts/ || true
           ls -la artifacts || true
 
