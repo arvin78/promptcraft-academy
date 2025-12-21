@@ -1,4 +1,4 @@
-name: Build Android (APK) from ZIP
+name: Build Android (RELEASE APK + AAB) from ZIP
 
 on:
   workflow_dispatch:
@@ -20,7 +20,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unzip python3
 
-      - name: Pick ZIP (any name)
+      - name: Pick ZIP
         id: pick
         shell: bash
         run: |
@@ -39,7 +39,6 @@ jobs:
           rm -rf extracted
           mkdir -p extracted
           unzip -q "${{ steps.pick.outputs.zip }}" -d extracted
-          ls -la extracted
 
       - name: Find Flutter root (pubspec.yaml)
         id: root
@@ -71,76 +70,6 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # -------- HOTFIXES (NO ZIP REUPLOAD) --------
-      - name: Hotfix - patch Dart compile errors (robust)
-        shell: bash
-        working-directory: ${{ steps.root.outputs.root }}
-        run: |
-          set -e
-          python3 - <<'PY'
-          import re, pathlib
-
-          def read(p: pathlib.Path) -> str:
-            return p.read_text(encoding="utf-8", errors="replace")
-
-          def write(p: pathlib.Path, s: str):
-            p.write_text(s, encoding="utf-8")
-
-          # 1) Fix quotes in error_lab_engine.dart (safe)
-          p1 = pathlib.Path("lib/src/services/error_lab_engine.dart")
-          if p1.exists():
-            t = read(p1)
-            t2 = t.replace("'...'", "\\'...\\'")
-            if t2 != t:
-              write(p1, t2)
-              print("Patched:", p1)
-
-          # 2) Fix prompt_builder_page.dart (remove ctx usage + rename controller)
-          p2 = pathlib.Path("lib/src/features/tools/prompt_builder_page.dart")
-          if p2.exists():
-            t = read(p2)
-
-            # (A) Always revert build signature to context
-            t = re.sub(r"Widget\s+build\s*\(\s*BuildContext\s+ctx\s*\)",
-                       "Widget build(BuildContext context)", t)
-
-            # (B) Replace any of(ctx) back to of(context) to avoid undefined ctx
-            t = t.replace("of(ctx)", "of(context)")
-
-            # (C) Rename TextEditingController variable named context/userContext -> ctxController
-            # handles: final context = TextEditingController(
-            t = re.sub(r"final\s+(?:userContext|context)\s*=\s*TextEditingController\s*\(",
-                       "final ctxController = TextEditingController(", t)
-            t = re.sub(r"late\s+final\s+(?:userContext|context)\s*=\s*TextEditingController\s*\(",
-                       "late final ctxController = TextEditingController(", t)
-
-            # (D) Replace references to controller
-            t = t.replace("userContext.text", "ctxController.text")
-            t = t.replace("context.text", "ctxController.text")
-            t = t.replace("userContext.dispose()", "ctxController.dispose()")
-            t = t.replace("context.dispose()", "ctxController.dispose()")
-
-            # (E) Replace field binding
-            t = t.replace("_field('کانتکست', userContext", "_field('کانتکست', ctxController")
-            t = t.replace("_field('کانتکست', context", "_field('کانتکست', ctxController")
-            t = t.replace('_field("کانتکست", userContext', '_field("کانتکست", ctxController')
-            t = t.replace('_field("کانتکست", context', '_field("کانتکست", ctxController')
-
-            write(p2, t)
-            print("Patched:", p2)
-
-          # 3) Fix num->double in dashboard_page.dart (regex)
-          p3 = pathlib.Path("lib/src/features/dashboard/dashboard_page.dart")
-          if p3.exists():
-            t = read(p3)
-            t2 = re.sub(r"(totalLessons\s*==\s*0\s*\?\s*)0(\s*:\s*\()",
-                        r"\g<1>0.0\g<2>", t)
-            if t2 != t:
-              write(p3, t2)
-              print("Patched:", p3)
-          PY
-      # -------------------------------------------
-
       - name: Ensure Android folder exists
         working-directory: ${{ steps.root.outputs.root }}
         run: |
@@ -152,78 +81,29 @@ jobs:
         working-directory: ${{ steps.root.outputs.root }}
         run: flutter pub get
 
-      - name: Build APK (debug, save log)
+      - name: Build RELEASE APKs (split ABI + universal)
         working-directory: ${{ steps.root.outputs.root }}
         shell: bash
         run: |
           set -o pipefail
-          flutter build apk --debug 2>&1 | tee flutter_build.log
+          flutter build apk --release --split-per-abi 2>&1 | tee flutter_build.log
+          flutter build apk --release 2>&1 | tee -a flutter_build.log
 
-      - name: Make ERROR_SUMMARY.txt (always)
-        if: always()
+      - name: Build RELEASE AAB (Play Store)
         working-directory: ${{ steps.root.outputs.root }}
         shell: bash
         run: |
-          python3 - <<'PY'
-          import re, pathlib
-          log = pathlib.Path("flutter_build.log")
-          out = pathlib.Path("ERROR_SUMMARY.txt")
-          if not log.exists():
-            out.write_text("flutter_build.log not found.\n", encoding="utf-8")
-            raise SystemExit(0)
+          set -o pipefail
+          flutter build appbundle --release 2>&1 | tee -a flutter_build.log
 
-          lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
-          keys = [
-            r"Target of URI doesn't exist",
-            r"Unable to load asset",
-            r"Font asset",
-            r"The method .+ isn't defined",
-            r"Undefined name",
-            r"Unhandled exception",
-            r"Exception:",
-            r"Error:",
-            r"A problem occurred",
-            r"FAILURE: Build failed",
-            r"Could not resolve",
-          ]
-
-          idx = None
-          hit = None
-          for k in keys:
-            rx = re.compile(k, re.IGNORECASE)
-            for i, ln in enumerate(lines):
-              if rx.search(ln):
-                idx, hit = i, k
-                break
-            if idx is not None:
-              break
-
-          if idx is None:
-            snippet = lines[-200:]
-            out.write_text("No pattern matched. Last 200 lines:\n\n" + "\n".join(snippet), encoding="utf-8")
-          else:
-            start = max(0, idx - 50)
-            end = min(len(lines), idx + 120)
-            out.write_text(f"Matched: {hit}\n\n" + "\n".join(lines[start:end]), encoding="utf-8")
-          PY
-
-      - name: Show ERROR_SUMMARY in Actions log
-        if: always()
-        working-directory: ${{ steps.root.outputs.root }}
-        shell: bash
-        run: |
-          echo "----- ERROR_SUMMARY.txt (first 200 lines) -----"
-          sed -n '1,200p' ERROR_SUMMARY.txt || true
-
-      - name: Collect artifacts (APK + logs)
+      - name: Collect artifacts (APKs + AAB + log)
         if: always()
         shell: bash
         run: |
           mkdir -p artifacts
           ROOT="${{ steps.root.outputs.root }}"
-          find "$ROOT/build" -type f -name "*.apk" -print -exec cp {} artifacts/ \; || true
+          find "$ROOT/build" -type f \( -name "*.apk" -o -name "*.aab" \) -print -exec cp {} artifacts/ \; || true
           [ -f "$ROOT/flutter_build.log" ] && cp "$ROOT/flutter_build.log" artifacts/ || true
-          [ -f "$ROOT/ERROR_SUMMARY.txt" ] && cp "$ROOT/ERROR_SUMMARY.txt" artifacts/ || true
           ls -la artifacts || true
 
       - name: Upload artifacts
@@ -231,4 +111,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: android-build
-          path: artifacts/* 
+          path: artifacts/*
