@@ -1,4 +1,4 @@
-name: Build Android APK (from ZIP, with Lessons)
+name: Build Android APK (Lessons Fix + arm64-v8a)
 
 on:
   workflow_dispatch:
@@ -28,33 +28,23 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Pick the correct project ZIP (must contain pubspec.yaml)
+      - name: Select ZIP (must contain pubspec.yaml)
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os, glob, zipfile, sys
+          import glob, zipfile, os, sys
 
           zips = [p for p in glob.glob("**/*.zip", recursive=True) if "/.git/" not in p and not p.startswith(".git/")]
           if not zips:
-              print("❌ No .zip found in repo.")
+              print("❌ No .zip found in repo")
               sys.exit(1)
-
-          def score(p: str) -> int:
-              n = os.path.basename(p).lower()
-              s = 0
-              if "promptcraft" in n: s += 5
-              if "buildable" in n: s += 3
-              if "repo" in n: s += 1
-              return s
-
-          zips.sort(key=lambda p: (-score(p), len(p)))
 
           chosen = None
           for p in zips:
               try:
                   with zipfile.ZipFile(p) as z:
-                      if any(name.endswith("pubspec.yaml") for name in z.namelist()):
+                      if any(n.endswith("pubspec.yaml") for n in z.namelist()):
                           chosen = p
                           break
               except Exception:
@@ -66,7 +56,7 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
               f.write(f"ZIP_PATH={chosen}\n")
 
-          print(f"✅ Using ZIP: {chosen}")
+          print("✅ Using ZIP:", chosen)
           PY
 
       - name: Extract ZIP
@@ -76,74 +66,39 @@ jobs:
           rm -rf extracted
           mkdir -p extracted
           unzip -q "$ZIP_PATH" -d extracted
-          echo "✅ Extracted to ./extracted"
 
-      - name: Find Flutter root (pubspec.yaml)
+      - name: Find Flutter ROOT (pubspec.yaml)
         shell: bash
         run: |
           set -euo pipefail
           ROOT="$(python3 - <<'PY'
-          import os
           from pathlib import Path
-
-          base = Path("extracted")
-          pubs = list(base.rglob("pubspec.yaml"))
+          pubs = list(Path("extracted").rglob("pubspec.yaml"))
           if not pubs:
               raise SystemExit("❌ pubspec.yaml not found after extraction")
           pubs.sort(key=lambda p: len(str(p)))
-          root = str(pubs[0].parent)
-          print(root)
+          print(str(pubs[0].parent))
           PY
           )"
           echo "ROOT=$ROOT" >> "$GITHUB_ENV"
-          echo "✅ Flutter root: $ROOT"
+          echo "✅ ROOT=$ROOT"
 
-      - name: Generate missing lesson contents (Persian) + ensure assets are included
+      - name: Fix missing lessons (create assets/lessons/*.md + patch pubspec assets)
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os, re, json
+          import os, re
           from pathlib import Path
 
           root = Path(os.environ["ROOT"])
-          report = []
+          assets_dir = root / "assets" / "lessons"
+          assets_dir.mkdir(parents=True, exist_ok=True)
 
-          # 1) Collect lessonIds + titles (best-effort) from JSONs
-          lesson_title = {}
-          id_re = re.compile(r"m\d{1,2}_l\d{1,3}", re.IGNORECASE)
+          # Find lesson IDs like m01_l01, m01_l107, ...
+          pat = re.compile(r"m\d{1,2}_l\d{1,3}", re.IGNORECASE)
+          ids = set()
 
-          def walk(obj):
-            if isinstance(obj, dict):
-              # common shapes:
-              # { "lessonId": "m01_l01", "title": "..." }
-              # { "id": "m01_l01", "title": "..." }
-              lid = obj.get("lessonId") or obj.get("lesson_id") or obj.get("id")
-              title = obj.get("title") or obj.get("name")
-              if isinstance(lid, str) and id_re.fullmatch(lid.strip()):
-                lid = lid.strip()
-                if isinstance(title, str) and title.strip():
-                  lesson_title[lid] = title.strip()
-              for v in obj.values():
-                walk(v)
-            elif isinstance(obj, list):
-              for v in obj:
-                walk(v)
-
-          json_files = list(root.rglob("*.json"))
-          for jf in json_files:
-            try:
-              txt = jf.read_text(encoding="utf-8", errors="ignore")
-              # quick filter
-              if "m01_l" not in txt and "lessonId" not in txt and "\"m" not in txt:
-                continue
-              obj = json.loads(txt)
-              walk(obj)
-            except Exception:
-              pass
-
-          # 2) Collect lessonIds from anywhere (regex fallback)
-          lesson_ids = set(lesson_title.keys())
           for f in root.rglob("*"):
             if not f.is_file():
               continue
@@ -153,153 +108,70 @@ jobs:
               txt = f.read_text(encoding="utf-8", errors="ignore")
             except Exception:
               continue
-            for m in id_re.finditer(txt):
-              lesson_ids.add(m.group(0))
+            for m in pat.finditer(txt):
+              ids.add(m.group(0).lower())
 
-          lesson_ids = sorted({lid.lower() for lid in lesson_ids})
-
-          # 3) Detect potential asset folders the app might use for lessons
-          asset_dirs = set(["assets/lessons/"])
-          dart_files = list(root.rglob("*.dart"))
-          asset_path_re = re.compile(r"(assets/[^'\"\s]+)", re.IGNORECASE)
-
-          for df in dart_files:
-            try:
-              txt = df.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-              continue
-            for m in asset_path_re.finditer(txt):
-              p = m.group(1)
-              if "lesson" in p.lower():
-                d = p.rsplit("/", 1)[0] + "/"
-                if d.startswith("assets/"):
-                  asset_dirs.add(d)
-
-          asset_dirs = sorted(asset_dirs)
-
-          # 4) Create lesson markdowns (one per lessonId) in ALL detected asset dirs (safe)
-          def make_md(lid: str, title: str) -> str:
-            t = title.strip() if title else lid
-            return f"""# {t}
-
-## هدف این درس
-- یادگیری مفهوم اصلی «{t}» به‌صورت ساده، قابل اجرا و قابل سنجش
-- توانایی ساخت یک پرامپت استاندارد و تکرارپذیر برای این موضوع
-
-## توضیح مفهومی (کامل ولی کاربردی)
-این درس روی «{t}» تمرکز دارد. برای اینکه واقعاً حرفه‌ای شوی، باید همیشه ۳ چیز را هم‌زمان نگه داری:
-1) **هدف دقیق** (چی می‌خوای؟ خروجی دقیقاً چه شکلی باشه؟)
-2) **ورودی‌ها و زمینه** (چه اطلاعاتی باید بدی تا مدل اشتباه نره؟)
-3) **معیار پذیرش** (چطور می‌فهمی جواب خوبه؟)
-
-### اشتباهات رایج
-- مبهم حرف زدن (هدف و خروجی مشخص نیست)
-- ننوشتن محدودیت‌ها (طول، لحن، قالب، منابع)
-- نداشتن نمونه خروجی (مدل حدس می‌زند)
-
-## الگوی پیشنهادی (قابل کپی)
-**Role:**  
-**Goal:**  
-**Context:**  
-**Inputs:**  
-**Constraints:**  
-**Output format:**  
-**Acceptance criteria:**  
-**Edge cases:**  
-
-## مثال عملی
-**سناریو:** می‌خواهم یک پاسخ ساختاریافته درباره یک موضوع بنویسی.  
-**پرامپت نمونه:**  
-Role: مدرس ارشد Prompt Engineering  
-Goal: تولید پاسخ آموزشی با مثال و تمرین  
-Context: مخاطب مبتدی است  
-Inputs: موضوع + سطح + محدودیت‌ها  
-Constraints: فارسی، بدون پیچیدگی اضافی، مثال واقعی  
-Output format: تیترها + بولت‌ها + تمرین + پاسخنامه  
-Acceptance criteria: بدون ابهام، قابل اجرا، پوشش خطاهای رایج
-
-## تمرین‌های حرفه‌ای
-### 1) چهارگزینه‌ای (MCQ)
-1. کدام مورد «Goal» را درست تعریف می‌کند؟
-- A) توضیح کلی  
-- B) خروجی دقیق و قابل سنجش ✅  
-- C) تعریف نقش  
-- D) منابع پیشنهادی  
-
-2. بهترین راه جلوگیری از برداشت اشتباه مدل چیست؟
-- A) طولانی‌نویسی  
-- B) مثال خروجی + معیار پذیرش ✅  
-- C) استفاده از کلمات سخت  
-- D) حذف محدودیت‌ها  
-
-### 2) جای‌خالی
-- یک پرامپت خوب باید «____»، «____» و «____» را شفاف کند.  
-(پیشنهاد پاسخ: هدف، ورودی‌ها/زمینه، قالب خروجی)
-
-### 3) مرتب‌سازی مراحل
-این مراحل را درست مرتب کن:
-- تعریف معیار پذیرش
-- تعیین نقش
-- مشخص‌کردن ورودی‌ها
-- تعیین قالب خروجی
-- تعریف هدف  
-**ترتیب پیشنهادی:** نقش → هدف → ورودی‌ها/زمینه → محدودیت‌ها/قالب → معیار پذیرش
-
-## پاسخنامه کوتاه
-- MCQ1: گزینه B
-- MCQ2: گزینه B
-"""
-          # ensure dirs exist & write files
+          ids = sorted(ids)
           created = 0
-          for ad in asset_dirs:
-            (root / ad).mkdir(parents=True, exist_ok=True)
+          for lid in ids:
+            p = assets_dir / f"{lid}.md"
+            if not p.exists() or p.stat().st_size < 40:
+              p.write_text(
+                f"# {lid}\n\n"
+                "این درس هنوز کامل نشده، اما این فایل اضافه شد تا پیام «محتوا پیدا نشد» نمایش داده نشود.\n\n"
+                "## خلاصه سریع\n"
+                "- هدف\n- نکات کلیدی\n- مثال\n- تمرین\n",
+                encoding="utf-8"
+              )
+              created += 1
 
-          for lid in lesson_ids:
-            title = lesson_title.get(lid, "")
-            md = make_md(lid, title)
-            for ad in asset_dirs:
-              out = root / ad / f"{lid}.md"
-              if not out.exists() or out.stat().st_size < 50:
-                out.write_text(md, encoding="utf-8")
-                created += 1
-
-          report.append(f"Detected lessonIds: {len(lesson_ids)}")
-          report.append(f"Detected lesson asset dirs: {asset_dirs}")
-          report.append(f"Markdown files created/updated: {created}")
-
-          # 5) Ensure pubspec.yaml includes these asset dirs (at least assets/lessons/)
+          # Patch pubspec.yaml safely (without duplicating flutter/assets)
           pubspec = root / "pubspec.yaml"
-          if pubspec.exists():
-            txt = pubspec.read_text(encoding="utf-8", errors="ignore")
-            needed = [d for d in asset_dirs if d.startswith("assets/")]
-            # ensure there is a flutter/assets section
-            if "flutter:" not in txt:
-              txt += "\nflutter:\n  assets:\n"
-            if re.search(r"(?m)^\s*assets:\s*$", txt) is None:
-              # add assets section under flutter:
-              m = re.search(r"(?m)^\s*flutter:\s*$", txt)
-              if m:
-                insert_at = m.end()
-                txt = txt[:insert_at] + "\n  assets:\n" + txt[insert_at:]
-              else:
-                txt += "\nflutter:\n  assets:\n"
+          txt = pubspec.read_text(encoding="utf-8", errors="ignore").splitlines(True)
 
-            # insert each dir if missing
-            for d in needed:
-              if d not in txt:
-                # naive: append under assets:
-                txt = re.sub(r"(?m)^(\s*assets:\s*)$",
-                             r"\1\n    - " + d,
-                             txt,
-                             count=1)
-            pubspec.write_text(txt, encoding="utf-8")
-            report.append("pubspec.yaml updated to include lesson assets.")
+          def find_line(rx):
+            for i, line in enumerate(txt):
+              if re.match(rx, line):
+                return i
+            return -1
+
+          flutter_i = find_line(r"^\s*flutter:\s*$")
+          if flutter_i == -1:
+            txt.append("\nflutter:\n")
+            txt.append("  assets:\n")
+            txt.append("    - assets/lessons/\n")
           else:
-            report.append("WARNING: pubspec.yaml not found at ROOT; cannot add assets section.")
+            # look for assets: under flutter:
+            assets_i = -1
+            for i in range(flutter_i + 1, len(txt)):
+              # stop if next top-level key starts
+              if re.match(r"^[A-Za-z_].*:\s*$", txt[i]) and not txt[i].startswith(" "):
+                break
+              if re.match(r"^\s{2}assets:\s*$", txt[i]):
+                assets_i = i
+                break
 
-          # 6) Write patch report
-          (root / "PATCH_REPORT.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
-          print("\n".join(report))
+            if assets_i == -1:
+              # insert assets section right after flutter:
+              insert_at = flutter_i + 1
+              txt.insert(insert_at, "  assets:\n")
+              txt.insert(insert_at + 1, "    - assets/lessons/\n")
+            else:
+              # check if already listed
+              already = any("assets/lessons/" in line for line in txt[assets_i:assets_i+200])
+              if not already:
+                txt.insert(assets_i + 1, "    - assets/lessons/\n")
+
+          pubspec.write_text("".join(txt), encoding="utf-8")
+
+          report = root / "PATCH_REPORT.txt"
+          report.write_text(
+            f"lesson_ids_found={len(ids)}\n"
+            f"md_created_or_updated={created}\n"
+            f"assets_path=assets/lessons/\n",
+            encoding="utf-8"
+          )
+          print(report.read_text(encoding="utf-8"))
           PY
 
       - name: Flutter pub get
@@ -309,32 +181,23 @@ Acceptance criteria: بدون ابهام، قابل اجرا، پوشش خطاه
           cd "$ROOT"
           flutter pub get
 
-      - name: Build DEBUG APKs (split per ABI + universal)
+      - name: Build APKs (split per ABI incl. arm64-v8a)
         shell: bash
         run: |
           set -euo pipefail
           cd "$ROOT"
           flutter build apk --debug --split-per-abi
-          flutter build apk --debug
 
       - name: Collect artifacts
         shell: bash
         run: |
           set -euo pipefail
-          cd "$ROOT"
-          mkdir -p ../out
-          cp -v build/app/outputs/flutter-apk/*.apk ../out/ || true
-          cp -v PATCH_REPORT.txt ../out/ || true
-          cat > ../out/INSTALL_README.txt <<'TXT'
-          نصب روی گوشی (arm64-v8a):
-          1) فایل app-arm64-v8a-debug.apk را نصب کن.
-          2) اگر "App not installed" دیدی:
-             - نسخه قبلی اپ را کامل Uninstall کن
-             - اجازه نصب از Unknown Sources را فعال کن
-          TXT
+          mkdir -p out
+          cp -v "$ROOT"/build/app/outputs/flutter-apk/*.apk out/ || true
+          cp -v "$ROOT"/PATCH_REPORT.txt out/ || true
 
-      - name: Upload APKs
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: android-apks
-          path: out 
+          path: out
