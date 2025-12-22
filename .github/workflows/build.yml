@@ -12,155 +12,85 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Find & extract project ZIP
-        id: zip
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # پیدا کردن اولین ZIP پروژه داخل ریپو
-          ZIP="$(find . -maxdepth 3 -type f -name '*.zip' ! -name 'android-build*.zip' | head -n 1 || true)"
-          if [ -z "$ZIP" ]; then
-            echo "No ZIP found in repo. Upload your project ZIP to the repo root (e.g. promptcraft_academy_repo_buildable_full (1).zip)." >&2
-            exit 1
-          fi
-
-          echo "Using ZIP: $ZIP"
-          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-
-          rm -rf extracted
-          mkdir -p extracted
-          unzip -q "$ZIP" -d extracted
-          echo "Extracted into extracted/"
-
-      - name: Locate Flutter project root (pubspec.yaml)
-        id: root
-        shell: bash
-        run: |
-          set -euo pipefail
-          ROOT="$(python3 - <<'PY'
-from pathlib import Path
-
-base = Path("extracted")
-cands = sorted(base.rglob("pubspec.yaml"), key=lambda p: len(p.parts))
-if not cands:
-    raise SystemExit("No pubspec.yaml found under extracted/. Your ZIP must contain a Flutter project.")
-print(str(cands[0].parent))
-PY
-)"
-          echo "Flutter root: $ROOT"
-          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: "temurin"
           java-version: "17"
 
       - name: Setup Flutter (stable)
         uses: subosito/flutter-action@v2
         with:
-          channel: stable
+          channel: "stable"
           cache: true
+
+      - name: Extract ZIP + Detect Flutter root
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP="$(find . -maxdepth 3 -type f -name '*.zip' ! -name 'android-build*.zip' | head -n 1 || true)"
+          if [ -z "$ZIP" ]; then
+            echo "No project ZIP found in repo."
+            exit 1
+          fi
+
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q "$ZIP" -d extracted
+
+          ROOT="$(python3 - <<'PY'
+from pathlib import Path
+base = Path("extracted")
+cands = sorted(base.rglob("pubspec.yaml"), key=lambda p: len(p.parts))
+print(str(cands[0].parent) if cands else "")
+PY
+)"
+          if [ -z "$ROOT" ]; then
+            echo "No pubspec.yaml found inside ZIP."
+            exit 1
+          fi
+
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Detected ROOT=$ROOT"
 
       - name: Flutter pub get
         shell: bash
         run: |
           set -euo pipefail
-          cd "${{ steps.root.outputs.root }}"
+          cd "$ROOT"
           flutter --version
           flutter pub get
 
-      - name: Build APKs (release + split per ABI) + save log
+      - name: Build APKs (release split per ABI)
         id: build
-        shell: bash
         continue-on-error: true
+        shell: bash
         run: |
-          set -uo pipefail
-          cd "${{ steps.root.outputs.root }}"
+          set -euo pipefail
+          cd "$ROOT"
+          flutter build apk --release --split-per-abi
 
-          rm -rf "${GITHUB_WORKSPACE}/out"
-          mkdir -p "${GITHUB_WORKSPACE}/out"
-
-          # بیلد را طوری می‌زنیم که اگر fail شد، job همونجا نخوابه؛ لاگ ذخیره شود
-          set +e
-          flutter build apk --release --split-per-abi > "${GITHUB_WORKSPACE}/out/flutter_build.log" 2>&1
-          EC=$?
-          set -e
-
-          echo "exit_code=$EC" >> "$GITHUB_OUTPUT"
-          echo "Flutter exit code: $EC"
-
-          APK_DIR="build/app/outputs/flutter-apk"
-          if [ -d "$APK_DIR" ]; then
-            cp -v "$APK_DIR"/*.apk "${GITHUB_WORKSPACE}/out/" || true
-          fi
-
-      - name: Create ERROR_SUMMARY.txt (always)
+      - name: Collect outputs (always)
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p out
-
-          LOG="out/flutter_build.log"
-          OUT="out/ERROR_SUMMARY.txt"
-
-          if [ ! -f "$LOG" ]; then
-            echo "No flutter_build.log was produced." > "$OUT"
-            exit 0
+          if [ -d "$ROOT/build/app/outputs/flutter-apk" ]; then
+            cp -v "$ROOT/build/app/outputs/flutter-apk/"*.apk out/ || true
           fi
+          echo "Build outcome: ${{ steps.build.outcome }}" > out/ERROR_SUMMARY.txt
 
-          python3 - <<'PY'
-import re
-from pathlib import Path
-
-log = Path("out/flutter_build.log").read_text(encoding="utf-8", errors="replace").splitlines()
-
-tokens = [
-  r"FAILURE:", r"BUILD FAILED", r"What went wrong", r"Error:", r"Exception:",
-  r"A problem occurred", r"Execution failed", r"Android resource linking failed",
-  r"Manifest merger failed", r"Could not", r"SDK location not found"
-]
-
-hits = []
-for i, line in enumerate(log):
-    if any(re.search(t, line) for t in tokens):
-        hits.append((i+1, line))
-
-out = []
-out.append("=== Key error lines (if any) ===")
-if hits:
-    for ln, line in hits[-80:]:
-        out.append(f"{ln}: {line}")
-else:
-    out.append("(No obvious error markers found in log.)")
-
-out.append("\n=== Last 250 lines ===")
-out.extend(log[-250:])
-
-Path("out/ERROR_SUMMARY.txt").write_text("\n".join(out), encoding="utf-8")
-print("Wrote out/ERROR_SUMMARY.txt")
-PY
-
-      - name: Package artifacts (always)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          (cd out && zip -r ../android-build.zip .)
-          ls -lah .
-
-      - name: Upload artifact (android-build.zip)
+      - name: Upload artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: android-build
-          path: android-build.zip
+          path: out
 
-      - name: Fail job only if build failed
-        if: ${{ steps.build.outputs.exit_code != '0' }}
-        shell: bash
+      - name: Fail job if build failed
+        if: ${{ steps.build.outcome != 'success' }}
         run: |
-          echo "Flutter build failed. Download artifact 'android-build' and open ERROR_SUMMARY.txt + flutter_build.log"
-          exit 1 
+          echo "Flutter build failed. Download artifact 'android-build' and open ERROR_SUMMARY.txt"
+          exit 1
