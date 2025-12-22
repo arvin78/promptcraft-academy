@@ -1,11 +1,11 @@
-name: Build Android (Release APKs for v8a) from ZIP
+name: Build APK (arm64-v8a)
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - "**/*.zip"
-      - ".github/workflows/**"
+      - "*.zip"
+      - ".github/workflows/build.yml"
 
 jobs:
   build:
@@ -15,169 +15,79 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install unzip + python
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip python3
+      - name: Setup Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          cache: true
 
-      - name: Pick ZIP (any name)
-        id: pick
+      - name: Find newest ZIP in repo root
+        id: zip
         shell: bash
         run: |
-          set -e
-          ZIP="$(find . -maxdepth 3 -type f -iname '*.zip' | head -n 1)"
-          if [ -z "$ZIP" ]; then
-            echo "ERROR: No .zip found in repo."
+          set -euo pipefail
+          shopt -s nullglob
+
+          files=( *.zip )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "❌ No .zip found in repo root." >&2
             exit 1
           fi
-          echo "Chosen ZIP: $ZIP"
-          echo "zip=$ZIP" >> $GITHUB_OUTPUT
 
-      - name: Copy ZIP to safe name (avoid spaces/parentheses issues)
-        shell: bash
-        run: |
-          rm -f source.zip
-          cp "${{ steps.pick.outputs.zip }}" source.zip
-          ls -lh source.zip
+          best_line=$(for f in "${files[@]}"; do
+            ts=$(git log -1 --format=%ct -- "$f" 2>/dev/null || echo 0)
+            echo "$ts $f"
+          done | sort -nr | head -n 1)
+
+          best=$(echo "$best_line" | awk '{ $1=""; sub(/^ /,""); print }')
+          echo "✅ Using ZIP: $best"
+          echo "zip=$best" >> "$GITHUB_OUTPUT"
 
       - name: Extract ZIP
         shell: bash
         run: |
-          rm -rf extracted
-          mkdir -p extracted
-          unzip -q source.zip -d extracted
-          echo "Extracted:"
-          ls -la extracted
+          set -euo pipefail
+          rm -rf app project
+          mkdir -p app
 
-      - name: Find Flutter root (pubspec.yaml)
-        id: root
-        shell: bash
-        run: |
-          set -e
-          if [ -f "extracted/pubspec.yaml" ]; then
-            ROOT="extracted"
+          unzip -q "${{ steps.zip.outputs.zip }}" -d app
+
+          # حالت 1: پروژه مستقیم داخل app/ است
+          if [ -f "app/pubspec.yaml" ]; then
+            mv app project
           else
-            PUBSPEC="$(find extracted -maxdepth 6 -name pubspec.yaml -print -quit)"
-            if [ -z "$PUBSPEC" ]; then
-              echo "ERROR: pubspec.yaml not found after unzip."
+            # حالت 2: پروژه داخل یک پوشه‌ی داخلی است
+            proj=$(find app -maxdepth 2 -name pubspec.yaml -print -quit | xargs -r dirname)
+            if [ -z "${proj:-}" ]; then
+              echo "❌ pubspec.yaml not found after unzip." >&2
+              find app -maxdepth 3 -type f | head -n 200
               exit 1
             fi
-            ROOT="$(dirname "$PUBSPEC")"
+            mv "$proj" project
           fi
-          echo "Using ROOT=$ROOT"
-          echo "root=$ROOT" >> $GITHUB_OUTPUT
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
+          echo "Project folder:"
+          ls -al project | head -n 50
 
       - name: Ensure Android folder exists
-        working-directory: ${{ steps.root.outputs.root }}
+        working-directory: project
+        shell: bash
         run: |
+          set -euo pipefail
           if [ ! -d "android" ]; then
-            flutter create --platforms android .
+            flutter create . --platforms=android
           fi
 
-      # ✅ Hotfixes (NO ZIP reupload) — fix Dart compile errors seen in your logs
-      - name: Hotfix Dart files (auto)
-        working-directory: ${{ steps.root.outputs.root }}
-        shell: bash
-        run: |
-          set -e
-          python3 - <<'PY'
-          import pathlib, re
-
-          def patch(path, fn):
-            p = pathlib.Path(path)
-            if not p.exists():
-              print("Skip missing:", path)
-              return
-            t = p.read_text(encoding="utf-8", errors="replace")
-            t2 = fn(t)
-            if t2 != t:
-              p.write_text(t2, encoding="utf-8")
-              print("Patched:", path)
-            else:
-              print("No change:", path)
-
-          # 1) Fix broken quotes in error_lab_engine.dart
-          def fix_error_lab(t: str) -> str:
-            # simplest safe fix: escape "'...'" anywhere
-            t = t.replace("'...'", "\\'...\\'")
-            # also convert the two known problematic lines into double-quoted strings if present
-            t = t.replace(
-              "'این خطا معمولاً از کوتیشن‌های شکسته یا متن چندخطی داخل \\'...\\'.',",
-              "\"این خطا معمولاً از کوتیشن‌های شکسته یا متن چندخطی داخل '...'.\","
-            )
-            t = t.replace(
-              "'در Dart برای متن چندخطی از \"\"\" استفاده کن، نه \\'...\\'.',",
-              "\"در Dart برای متن چندخطی از \\\"\\\"\\\" استفاده کن، نه '...'.\","
-            )
-            return t
-
-          patch("lib/src/services/error_lab_engine.dart", fix_error_lab)
-
-          # 2) Fix prompt_builder_page.dart: controller named 'context' conflicts with BuildContext
-          def fix_prompt_builder(t: str) -> str:
-            # rename controller variable to ctxController
-            t = re.sub(r"\bfinal\s+context\s*=\s*TextEditingController\b", "final ctxController = TextEditingController", t)
-            t = re.sub(r"\blate\s+final\s+context\s*=\s*TextEditingController\b", "late final ctxController = TextEditingController", t)
-
-            # replace controller usages ONLY in controller context places
-            t = t.replace("context.text", "ctxController.text")
-            t = t.replace("context.dispose()", "ctxController.dispose()")
-            t = t.replace("_field('کانتکست', context", "_field('کانتکست', ctxController")
-            t = t.replace('_field("کانتکست", context', '_field("کانتکست", ctxController')
-
-            # ensure build signature uses BuildContext context (not ctx)
-            t = re.sub(r"Widget\s+build\s*\(\s*BuildContext\s+\w+\s*\)", "Widget build(BuildContext context)", t)
-
-            return t
-
-          patch("lib/src/features/tools/prompt_builder_page.dart", fix_prompt_builder)
-
-          # 3) Fix dashboard num->double (0 -> 0.0)
-          def fix_dashboard(t: str) -> str:
-            # make ternary return double
-            t = re.sub(r"(totalLessons\s*==\s*0\s*\?\s*)0(\s*:\s*)", r"\g<1>0.0\g<2>", t)
-            return t
-
-          patch("lib/src/features/dashboard/dashboard_page.dart", fix_dashboard)
-          PY
-
       - name: Pub get
-        working-directory: ${{ steps.root.outputs.root }}
+        working-directory: project
         run: flutter pub get
 
-      - name: Build RELEASE APKs (split ABI + universal)
-        working-directory: ${{ steps.root.outputs.root }}
-        shell: bash
-        run: |
-          set -o pipefail
-          flutter build apk --release --split-per-abi 2>&1 | tee flutter_build.log
-          flutter build apk --release 2>&1 | tee -a flutter_build.log
+      - name: Build arm64-v8a release APK (split per ABI)
+        working-directory: project
+        run: flutter build apk --release --split-per-abi
 
-      - name: Collect artifacts (APKs + log)
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p artifacts
-          ROOT="${{ steps.root.outputs.root }}"
-          find "$ROOT/build" -type f -name "*.apk" -print -exec cp {} artifacts/ \; || true
-          [ -f "$ROOT/flutter_build.log" ] && cp "$ROOT/flutter_build.log" artifacts/ || true
-          ls -la artifacts || true
-
-      - name: Upload artifacts
-        if: always()
+      - name: Upload artifact (arm64-v8a)
         uses: actions/upload-artifact@v4
         with:
-          name: android-build
-          path: artifacts/*
+          name: app-arm64-v8a-release
+          path: project/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk 
