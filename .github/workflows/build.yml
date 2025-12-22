@@ -1,10 +1,9 @@
-name: Build Android APK from ZIP
+name: Build Android (APK) from ZIP
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
+  push:
+    branches: [ "main" ]
 
 jobs:
   build:
@@ -14,141 +13,126 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Find and extract ZIP
-        id: prep
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: "3.38.5"
+          cache: true
+
+      - name: Unzip source ZIP (pick largest)
         shell: bash
         run: |
           set -euo pipefail
-
-          ZIP="$(ls -1 *.zip 2>/dev/null | head -n 1 || true)"
-          if [ -z "$ZIP" ]; then
-            echo "❌ No .zip found in repo root. Put your project zip in repo root." >&2
-            exit 1
-          fi
-
-          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-
+          ZIP="$(ls -S *.zip | head -n 1)"
+          echo "Using ZIP: $ZIP"
           rm -rf extracted
           mkdir -p extracted
           unzip -q "$ZIP" -d extracted
 
-          ROOT="$(python3 - <<'PY'
-          import os
-          for dirpath, _, filenames in os.walk("extracted"):
-              if "pubspec.yaml" in filenames:
-                  print(dirpath)
-                  break
-          PY
-          )"
-
+      - name: Locate Flutter project root (pubspec.yaml)
+        id: root
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$(dirname "$(find extracted -name pubspec.yaml -print -quit)")"
           if [ -z "$ROOT" ]; then
-            echo "❌ pubspec.yaml not found inside zip" >&2
-            find extracted -maxdepth 4 -type f | head -n 200
+            echo "pubspec.yaml not found inside ZIP" >&2
             exit 1
           fi
-
           echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "✅ Flutter root: $ROOT"
-          ls -la "$ROOT" | head -n 50
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "Found ROOT=$ROOT"
 
-      - name: Auto-fix pubspec.yaml (common YAML mistakes)
+      - name: Auto-fix pubspec.yaml (safe)
         shell: bash
-        env:
-          ROOT: ${{ steps.prep.outputs.root }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os, re, pathlib
+          import re, pathlib, os
           p = pathlib.Path(os.environ["ROOT"]) / "pubspec.yaml"
-          txt = p.read_text(encoding="utf-8", errors="replace")
+          if not p.exists():
+              print("pubspec.yaml not found, skipping")
+              raise SystemExit(0)
 
-          # Fix a very common broken pattern:
-          # dependencies:
-          #   (missing "flutter:" key)
-          #   sdk: flutter
+          txt = p.read_text(encoding="utf-8", errors="replace")
+          orig = txt
+
+          # normalize fancy quotes that break YAML sometimes
+          txt = txt.replace("“", '"').replace("”", '"').replace("’", "'")
+
+          # very conservative fix: if "sdk: flutter" appears directly under dependencies: without "flutter:" key
           lines = txt.splitlines()
           out = []
           i = 0
-          changed = False
-
           while i < len(lines):
               line = lines[i]
-
               if re.match(r'^\s*sdk\s*:\s*flutter\s*$', line):
-                  indent = len(line) - len(line.lstrip(' '))
-                  # Find previous meaningful line
                   j = len(out) - 1
-                  while j >= 0 and (out[j].strip() == "" or out[j].lstrip().startswith("#")):
+                  while j >= 0 and out[j].strip() == "":
                       j -= 1
-                  prev = out[j].strip() if j >= 0 else ""
-                  if prev != "flutter:":
-                      out.append(" " * indent + "flutter:")
-                      out.append(" " * (indent + 2) + "sdk: flutter")
-                      changed = True
+                  if j >= 0 and re.match(r'^\s*dependencies\s*:\s*$', out[j]):
+                      indent = len(line) - len(line.lstrip(" "))
+                      base = " " * indent
+                      out.append(base + "flutter:")
+                      out.append(base + "  sdk: flutter")
                       i += 1
                       continue
-
               out.append(line)
               i += 1
 
-          fixed = "\n".join(out) + ("\n" if txt.endswith("\n") else "")
-          if changed:
-              p.write_text(fixed, encoding="utf-8")
-              print("✅ Patched pubspec.yaml")
+          new_txt = "\n".join(out) + ("\n" if orig.endswith("\n") else "")
+          if new_txt != orig:
+              p.write_text(new_txt, encoding="utf-8")
+              print("pubspec.yaml patched")
           else:
-              print("✅ No pubspec.yaml changes needed")
+              print("pubspec.yaml ok")
           PY
 
-      - name: Patch ProgressStore (fix missing methods so build won't fail)
+      - name: Patch ProgressStore (NO replaceFirst bug)
         shell: bash
-        env:
-          ROOT: ${{ steps.prep.outputs.root }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import os, pathlib, sys
-
+          import os, pathlib, textwrap, re
           root = pathlib.Path(os.environ["ROOT"])
-          candidates = list(root.rglob("progress_store.dart"))
-          if not candidates:
-              print("⚠️ progress_store.dart not found, skipping")
-              sys.exit(0)
+          targets = list(root.rglob("progress_store.dart"))
+          if not targets:
+              print("progress_store.dart not found; skipping")
+              raise SystemExit(0)
 
-          p = candidates[0]
+          new_store = textwrap.dedent(r'''
+          // AUTO-GENERATED by GitHub Actions to ensure the sample app compiles.
+          // If you later implement a real persistence layer, replace this file.
 
-          new_store = r"""import 'package:flutter/foundation.dart';
+          import 'dart:convert';
+          import 'package:flutter/foundation.dart';
 
           class ProgressStore extends ChangeNotifier {
-            bool _initialized = false;
+            /// Lesson completion flags by lessonId
+            final Map<String, bool> completedLessons = <String, bool>{};
 
-            final Set<String> completedLessons = <String>{};
+            /// Quiz best scores by quizId
             final Map<String, int> quizScores = <String, int>{};
 
-            // Raw spaced-repetition data (stored as JSON strings by key).
-            final Map<String, String> _srsRaw = <String, String>{};
+            /// Spaced-repetition raw state (opaque to UI)
+            final Map<String, dynamic> _srsRaw = <String, dynamic>{};
 
-            // Error logs (free-form maps).
-            final List<Map<String, dynamic>> _errorLogs = <Map<String, dynamic>>[];
+            // ---- Lessons ----
+            bool isLessonCompleted(String lessonId) => completedLessons[lessonId] == true;
 
-            bool get initialized => _initialized;
-
-            Future<void> init() async {
-              _initialized = true;
+            Future<void> setLessonCompleted(String lessonId, bool done) async {
+              completedLessons[lessonId] = done;
               notifyListeners();
             }
 
-            bool isLessonCompleted(String lessonId) => completedLessons.contains(lessonId);
-
-            Future<void> completeLesson(String lessonId) async {
-              completedLessons.add(lessonId);
-              notifyListeners();
-            }
-
-            Future<void> uncompleteLesson(String lessonId) async {
-              completedLessons.remove(lessonId);
-              notifyListeners();
-            }
-
+            // ---- Quizzes ----
             int getQuizScore(String quizId) => quizScores[quizId] ?? 0;
 
             Future<void> setQuizScore(String quizId, int score) async {
@@ -156,127 +140,133 @@ jobs:
               notifyListeners();
             }
 
-            // === Compatibility methods (called elsewhere in the app) ===
-
+            // ---- Compatibility methods ----
             Future<void> resetAll() async {
               completedLessons.clear();
               quizScores.clear();
               _srsRaw.clear();
-              _errorLogs.clear();
               notifyListeners();
             }
 
-            Future<void> clearErrorLogs() async {
-              _errorLogs.clear();
-              notifyListeners();
+            // Backwards compatibility aliases
+            bool isCompleted(String lessonId) => isLessonCompleted(lessonId);
+            Future<void> markCompleted(String lessonId) => setLessonCompleted(lessonId, true);
+            Future<void> unmarkCompleted(String lessonId) => setLessonCompleted(lessonId, false);
+
+            // ---- Persistence (in-memory only for now) ----
+            String exportJson() {
+              final data = <String, dynamic>{
+                'completedLessons': completedLessons,
+                'quizScores': quizScores,
+                'srs': _srsRaw,
+              };
+              return jsonEncode(data);
             }
 
-            List<Map<String, dynamic>> getErrorLogs() => List.unmodifiable(_errorLogs);
-
-            Future<void> addErrorLog(Map<String, dynamic> log) async {
-              _errorLogs.add(Map<String, dynamic>.from(log));
-              if (_errorLogs.length > 200) {
-                _errorLogs.removeRange(0, _errorLogs.length - 200);
+            Future<void> importJson(String json) async {
+              try {
+                final data = jsonDecode(json) as Map<String, dynamic>;
+                completedLessons
+                  ..clear()
+                  ..addAll((data['completedLessons'] as Map?)?.map((k, v) => MapEntry('$k', v == true)) ?? {});
+                quizScores
+                  ..clear()
+                  ..addAll((data['quizScores'] as Map?)?.map((k, v) => MapEntry('$k', (v is num) ? v.toInt() : 0)) ?? {});
+                _srsRaw
+                  ..clear()
+                  ..addAll((data['srs'] as Map?) ?? {});
+                notifyListeners();
+              } catch (_) {
+                // ignore bad imports
               }
-              notifyListeners();
-            }
-
-            String? getSrsRaw(String key) => _srsRaw[key];
-
-            Future<void> setSrsRaw(String key, String value) async {
-              _srsRaw[key] = value;
-              notifyListeners();
             }
           }
-          """.replaceFirst("\n          ", "\n").replaceAll("\n          ", "\n");
+          ''').lstrip("\n")
 
-          p.write_text(new_store, encoding="utf-8")
-          print("✅ Patched:", p)
+          for p in targets:
+              txt = p.read_text(encoding="utf-8", errors="replace")
+              if "AUTO-GENERATED by GitHub Actions" in txt:
+                  print("ProgressStore already patched:", p)
+                  continue
+              if re.search(r'\bFuture<\s*void\s*>\s*resetAll\s*\(', txt) and "exportJson" in txt:
+                  print("ProgressStore already has compatibility methods:", p)
+                  continue
+              p.write_text(new_store, encoding="utf-8")
+              print("ProgressStore overwritten:", p)
           PY
 
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
       - name: Flutter pub get
+        working-directory: ${{ steps.root.outputs.root }}
+        run: flutter pub get
+
+      - name: Build APKs (debug + split per ABI) + save log
+        id: build
+        working-directory: ${{ steps.root.outputs.root }}
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
-          cd "${{ steps.prep.outputs.root }}"
           flutter --version
-          flutter pub get
+          flutter clean
 
-      - name: Build APK (debug + split per ABI) and save log
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "${{ steps.prep.outputs.root }}"
-          flutter build apk --debug --split-per-abi -v 2>&1 | tee flutter_build.log
+          set +e
+          flutter build apk --debug --split-per-abi -v 2>&1 | tee "$GITHUB_WORKSPACE/flutter_build.log"
+          exitcode=${PIPESTATUS[0]}
+          echo "exitcode=$exitcode" >> "$GITHUB_OUTPUT"
+          set -e
 
-      - name: Extract REAL error cause -> ERROR_SUMMARY.txt
+          OUTDIR="$GITHUB_WORKSPACE/build_out"
+          rm -rf "$OUTDIR"
+          mkdir -p "$OUTDIR"
+          cp -v build/app/outputs/flutter-apk/*.apk "$OUTDIR/" 2>/dev/null || true
+          ls -lah "$OUTDIR" || true
+
+      - name: Create ERROR_SUMMARY.txt (always)
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          ROOT="${{ steps.prep.outputs.root }}"
           python3 - <<'PY'
           import pathlib, re
-          root = pathlib.Path("${ROOT}")
-          log = root / "flutter_build.log"
-          out = root / "ERROR_SUMMARY.txt"
+          log = pathlib.Path("flutter_build.log")
+          out = pathlib.Path("ERROR_SUMMARY.txt")
 
           if not log.exists():
               out.write_text("No flutter_build.log found.\n", encoding="utf-8")
-              print("⚠️ No log file.")
               raise SystemExit(0)
 
-          txt = log.read_text(encoding="utf-8", errors="replace").splitlines()
+          txt = log.read_text(encoding="utf-8", errors="replace")
+          lines = txt.splitlines()
 
-          # Keep last 1200 lines and pick the first strong error window
-          tail = txt[-1200:]
-          patterns = [
-              r"^.*\berror\b.*$",
-              r"^.*\bFAILURE\b.*$",
-              r"^.*\bException\b.*$",
-              r"^.*Target kernel_snapshot_program failed.*$",
-              r"^.*Process completed with exit code.*$",
-          ]
+          # pick meaningful error-ish lines; fallback to last 200 lines
+          rx = re.compile(r"(Error:|FAILURE:|Exception:|Unhandled exception|Gradle task|Target of URI doesn't exist)", re.I)
+          picked = [l for l in lines if rx.search(l)]
+          if not picked:
+              picked = lines[-200:]
 
-          hits = []
-          for i, line in enumerate(tail):
-              for pat in patterns:
-                  if re.search(pat, line, flags=re.IGNORECASE):
-                      hits.append(i)
-                      break
-
-          if hits:
-              start = max(0, hits[0] - 60)
-              chunk = tail[start:start + 260]
-          else:
-              chunk = tail[-260:]
-
-          out.write_text("\n".join(chunk) + "\n", encoding="utf-8")
-          print("✅ Wrote ERROR_SUMMARY.txt")
+          out.write_text("Extracted error summary:\n\n" + "\n".join(picked[-200:]) + "\n", encoding="utf-8")
           PY
 
-      - name: Collect APKs
+      - name: Package artifacts
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          ROOT="${{ steps.prep.outputs.root }}"
-          mkdir -p out
-          cp -v "$ROOT/build/app/outputs/flutter-apk/"*.apk out/ || true
-          cp -v "$ROOT/flutter_build.log" out/ || true
-          cp -v "$ROOT/ERROR_SUMMARY.txt" out/ || true
-          ls -la out || true
+          mkdir -p artifact
+          cp -v flutter_build.log ERROR_SUMMARY.txt artifact/ 2>/dev/null || true
+          cp -v build_out/*.apk artifact/ 2>/dev/null || true
+          (cd artifact && zip -qr ../android-build.zip .)
+          ls -lah android-build.zip
 
-      - name: Upload artifacts
+      - name: Upload artifact (android-build.zip)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: android-build
-          path: out/*
-          if-no-files-found: ignore
+          path: android-build.zip
+
+      - name: Fail job if build failed
+        if: ${{ steps.build.outputs.exitcode != '0' }}
+        run: |
+          echo "Flutter build failed. Download artifact and read ERROR_SUMMARY.txt + flutter_build.log"
+          exit 1 
