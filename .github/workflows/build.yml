@@ -1,9 +1,11 @@
-name: Build Android APK (FINAL v3 - ZIP + Bootstrap + Full AutoPatch)
+name: Build Android APK (from ZIP, with Lessons)
 
 on:
   workflow_dispatch:
   push:
-    branches: [ "main" ]
+    paths:
+      - ".github/workflows/build.yml"
+      - "**/*.zip"
 
 jobs:
   build:
@@ -13,402 +15,326 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
-          distribution: "temurin"
+          distribution: temurin
           java-version: "17"
 
-      - name: Setup Flutter (stable)
+      - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: "stable"
+          flutter-version: "3.22.3"
+          channel: stable
           cache: true
 
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip python3 rsync
-
-      - name: Pick ZIP (newest)
+      - name: Pick the correct project ZIP (must contain pubspec.yaml)
         shell: bash
         run: |
-          set -e
-          ZIP="$(find . -maxdepth 8 -type f -iname '*.zip' -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2- || true)"
-          if [ -z "$ZIP" ]; then
-            echo "ERROR: No ZIP found in repo."
-            find . -maxdepth 4 -type f -print
-            exit 1
-          fi
-          echo "Found ZIP: $ZIP"
-          cp "$ZIP" safe.zip
-          ls -lah safe.zip
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, glob, zipfile, sys
+
+          zips = [p for p in glob.glob("**/*.zip", recursive=True) if "/.git/" not in p and not p.startswith(".git/")]
+          if not zips:
+              print("❌ No .zip found in repo.")
+              sys.exit(1)
+
+          def score(p: str) -> int:
+              n = os.path.basename(p).lower()
+              s = 0
+              if "promptcraft" in n: s += 5
+              if "buildable" in n: s += 3
+              if "repo" in n: s += 1
+              return s
+
+          zips.sort(key=lambda p: (-score(p), len(p)))
+
+          chosen = None
+          for p in zips:
+              try:
+                  with zipfile.ZipFile(p) as z:
+                      if any(name.endswith("pubspec.yaml") for name in z.namelist()):
+                          chosen = p
+                          break
+              except Exception:
+                  pass
+
+          if not chosen:
+              chosen = zips[0]
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as f:
+              f.write(f"ZIP_PATH={chosen}\n")
+
+          print(f"✅ Using ZIP: {chosen}")
+          PY
 
       - name: Extract ZIP
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           rm -rf extracted
           mkdir -p extracted
-          unzip -q safe.zip -d extracted
-          echo "Extracted top:"
-          ls -lah extracted | head -n 80
+          unzip -q "$ZIP_PATH" -d extracted
+          echo "✅ Extracted to ./extracted"
 
       - name: Find Flutter root (pubspec.yaml)
-        id: unpacked
         shell: bash
         run: |
-          set -e
-          ROOT="$(find extracted -maxdepth 12 -type f -name pubspec.yaml -print -quit | xargs -r dirname)"
-          if [ -z "$ROOT" ]; then
-            echo "ERROR: pubspec.yaml not found after unzip."
-            find extracted -maxdepth 12 -name pubspec.yaml -print || true
-            exit 1
-          fi
-          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "Unpacked root: $ROOT"
-
-      - name: Bootstrap Android project if missing/unsupported
-        id: root
-        shell: bash
-        env:
-          ROOT: ${{ steps.unpacked.outputs.root }}
-        run: |
-          set -e
-          echo "Checking Android scaffold in: $ROOT"
-
-          if [ -d "$ROOT/android" ] && ( [ -f "$ROOT/android/build.gradle" ] || [ -f "$ROOT/android/build.gradle.kts" ] ); then
-            echo "Android folder exists. Using original project."
-            echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          echo "Android folder missing/unsupported => Creating fresh Flutter Android scaffold (recommended fix)..."
-          rm -rf workapp
-          flutter create -t app workapp --platforms=android --org com.promptcraft.academy
-
-          # Copy project content on top, keep generated android/
-          rsync -a \
-            --exclude=android --exclude=ios --exclude=linux --exclude=macos --exclude=windows --exclude=web \
-            --exclude=.dart_tool --exclude=build \
-            "$ROOT"/ workapp/
-
-          echo "Using bootstrapped project: workapp"
-          echo "root=workapp" >> "$GITHUB_OUTPUT"
-
-      - name: Full AutoPatch (fix CURRENT errors)
-        shell: bash
-        env:
-          ROOT: ${{ steps.root.outputs.root }}
-        run: |
-          set -e
-          echo "AutoPatch root: $ROOT"
-          python3 - <<'PY'
-          import os, re, textwrap
+          set -euo pipefail
+          ROOT="$(python3 - <<'PY'
+          import os
           from pathlib import Path
-          from datetime import datetime
+
+          base = Path("extracted")
+          pubs = list(base.rglob("pubspec.yaml"))
+          if not pubs:
+              raise SystemExit("❌ pubspec.yaml not found after extraction")
+          pubs.sort(key=lambda p: len(str(p)))
+          root = str(pubs[0].parent)
+          print(root)
+          PY
+          )"
+          echo "ROOT=$ROOT" >> "$GITHUB_ENV"
+          echo "✅ Flutter root: $ROOT"
+
+      - name: Generate missing lesson contents (Persian) + ensure assets are included
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, json
+          from pathlib import Path
 
           root = Path(os.environ["ROOT"])
           report = []
 
-          def find_one(filename: str):
-            hits = list(root.rglob(filename))
-            return hits[0] if hits else None
+          # 1) Collect lessonIds + titles (best-effort) from JSONs
+          lesson_title = {}
+          id_re = re.compile(r"m\d{1,2}_l\d{1,3}", re.IGNORECASE)
 
-          def safe_read(p: Path):
-            return p.read_text(encoding="utf-8", errors="ignore")
+          def walk(obj):
+            if isinstance(obj, dict):
+              # common shapes:
+              # { "lessonId": "m01_l01", "title": "..." }
+              # { "id": "m01_l01", "title": "..." }
+              lid = obj.get("lessonId") or obj.get("lesson_id") or obj.get("id")
+              title = obj.get("title") or obj.get("name")
+              if isinstance(lid, str) and id_re.fullmatch(lid.strip()):
+                lid = lid.strip()
+                if isinstance(title, str) and title.strip():
+                  lesson_title[lid] = title.strip()
+              for v in obj.values():
+                walk(v)
+            elif isinstance(obj, list):
+              for v in obj:
+                walk(v)
 
-          def safe_write(p: Path, text: str):
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(text, encoding="utf-8")
+          json_files = list(root.rglob("*.json"))
+          for jf in json_files:
+            try:
+              txt = jf.read_text(encoding="utf-8", errors="ignore")
+              # quick filter
+              if "m01_l" not in txt and "lessonId" not in txt and "\"m" not in txt:
+                continue
+              obj = json.loads(txt)
+              walk(obj)
+            except Exception:
+              pass
 
-          def log(msg: str):
-            report.append(msg)
-            print(msg)
+          # 2) Collect lessonIds from anywhere (regex fallback)
+          lesson_ids = set(lesson_title.keys())
+          for f in root.rglob("*"):
+            if not f.is_file():
+              continue
+            if f.suffix.lower() not in (".dart", ".json", ".md", ".txt", ".yaml", ".yml"):
+              continue
+            try:
+              txt = f.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+              continue
+            for m in id_re.finditer(txt):
+              lesson_ids.add(m.group(0))
 
-          log("== AutoPatch FINAL v3 start ==")
+          lesson_ids = sorted({lid.lower() for lid in lesson_ids})
 
-          # A) Fix Dart quote issues (safe)
-          p = find_one("error_lab_engine.dart")
-          if p:
-            txt = safe_read(p)
-            before = txt
-            txt = txt.replace("داخل '...'.", "داخل \\'...\\'.")
-            txt = txt.replace("نه '...'.", "نه \\'...\\'.")
-            if txt != before:
-              safe_write(p, txt)
-              log(f"Patched quotes: {p}")
-            else:
-              log(f"No quote patch needed: {p}")
+          # 3) Detect potential asset folders the app might use for lessons
+          asset_dirs = set(["assets/lessons/"])
+          dart_files = list(root.rglob("*.dart"))
+          asset_path_re = re.compile(r"(assets/[^'\"\s]+)", re.IGNORECASE)
+
+          for df in dart_files:
+            try:
+              txt = df.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+              continue
+            for m in asset_path_re.finditer(txt):
+              p = m.group(1)
+              if "lesson" in p.lower():
+                d = p.rsplit("/", 1)[0] + "/"
+                if d.startswith("assets/"):
+                  asset_dirs.add(d)
+
+          asset_dirs = sorted(asset_dirs)
+
+          # 4) Create lesson markdowns (one per lessonId) in ALL detected asset dirs (safe)
+          def make_md(lid: str, title: str) -> str:
+            t = title.strip() if title else lid
+            return f"""# {t}
+
+## هدف این درس
+- یادگیری مفهوم اصلی «{t}» به‌صورت ساده، قابل اجرا و قابل سنجش
+- توانایی ساخت یک پرامپت استاندارد و تکرارپذیر برای این موضوع
+
+## توضیح مفهومی (کامل ولی کاربردی)
+این درس روی «{t}» تمرکز دارد. برای اینکه واقعاً حرفه‌ای شوی، باید همیشه ۳ چیز را هم‌زمان نگه داری:
+1) **هدف دقیق** (چی می‌خوای؟ خروجی دقیقاً چه شکلی باشه؟)
+2) **ورودی‌ها و زمینه** (چه اطلاعاتی باید بدی تا مدل اشتباه نره؟)
+3) **معیار پذیرش** (چطور می‌فهمی جواب خوبه؟)
+
+### اشتباهات رایج
+- مبهم حرف زدن (هدف و خروجی مشخص نیست)
+- ننوشتن محدودیت‌ها (طول، لحن، قالب، منابع)
+- نداشتن نمونه خروجی (مدل حدس می‌زند)
+
+## الگوی پیشنهادی (قابل کپی)
+**Role:**  
+**Goal:**  
+**Context:**  
+**Inputs:**  
+**Constraints:**  
+**Output format:**  
+**Acceptance criteria:**  
+**Edge cases:**  
+
+## مثال عملی
+**سناریو:** می‌خواهم یک پاسخ ساختاریافته درباره یک موضوع بنویسی.  
+**پرامپت نمونه:**  
+Role: مدرس ارشد Prompt Engineering  
+Goal: تولید پاسخ آموزشی با مثال و تمرین  
+Context: مخاطب مبتدی است  
+Inputs: موضوع + سطح + محدودیت‌ها  
+Constraints: فارسی، بدون پیچیدگی اضافی، مثال واقعی  
+Output format: تیترها + بولت‌ها + تمرین + پاسخنامه  
+Acceptance criteria: بدون ابهام، قابل اجرا، پوشش خطاهای رایج
+
+## تمرین‌های حرفه‌ای
+### 1) چهارگزینه‌ای (MCQ)
+1. کدام مورد «Goal» را درست تعریف می‌کند؟
+- A) توضیح کلی  
+- B) خروجی دقیق و قابل سنجش ✅  
+- C) تعریف نقش  
+- D) منابع پیشنهادی  
+
+2. بهترین راه جلوگیری از برداشت اشتباه مدل چیست؟
+- A) طولانی‌نویسی  
+- B) مثال خروجی + معیار پذیرش ✅  
+- C) استفاده از کلمات سخت  
+- D) حذف محدودیت‌ها  
+
+### 2) جای‌خالی
+- یک پرامپت خوب باید «____»، «____» و «____» را شفاف کند.  
+(پیشنهاد پاسخ: هدف، ورودی‌ها/زمینه، قالب خروجی)
+
+### 3) مرتب‌سازی مراحل
+این مراحل را درست مرتب کن:
+- تعریف معیار پذیرش
+- تعیین نقش
+- مشخص‌کردن ورودی‌ها
+- تعیین قالب خروجی
+- تعریف هدف  
+**ترتیب پیشنهادی:** نقش → هدف → ورودی‌ها/زمینه → محدودیت‌ها/قالب → معیار پذیرش
+
+## پاسخنامه کوتاه
+- MCQ1: گزینه B
+- MCQ2: گزینه B
+"""
+          # ensure dirs exist & write files
+          created = 0
+          for ad in asset_dirs:
+            (root / ad).mkdir(parents=True, exist_ok=True)
+
+          for lid in lesson_ids:
+            title = lesson_title.get(lid, "")
+            md = make_md(lid, title)
+            for ad in asset_dirs:
+              out = root / ad / f"{lid}.md"
+              if not out.exists() or out.stat().st_size < 50:
+                out.write_text(md, encoding="utf-8")
+                created += 1
+
+          report.append(f"Detected lessonIds: {len(lesson_ids)}")
+          report.append(f"Detected lesson asset dirs: {asset_dirs}")
+          report.append(f"Markdown files created/updated: {created}")
+
+          # 5) Ensure pubspec.yaml includes these asset dirs (at least assets/lessons/)
+          pubspec = root / "pubspec.yaml"
+          if pubspec.exists():
+            txt = pubspec.read_text(encoding="utf-8", errors="ignore")
+            needed = [d for d in asset_dirs if d.startswith("assets/")]
+            # ensure there is a flutter/assets section
+            if "flutter:" not in txt:
+              txt += "\nflutter:\n  assets:\n"
+            if re.search(r"(?m)^\s*assets:\s*$", txt) is None:
+              # add assets section under flutter:
+              m = re.search(r"(?m)^\s*flutter:\s*$", txt)
+              if m:
+                insert_at = m.end()
+                txt = txt[:insert_at] + "\n  assets:\n" + txt[insert_at:]
+              else:
+                txt += "\nflutter:\n  assets:\n"
+
+            # insert each dir if missing
+            for d in needed:
+              if d not in txt:
+                # naive: append under assets:
+                txt = re.sub(r"(?m)^(\s*assets:\s*)$",
+                             r"\1\n    - " + d,
+                             txt,
+                             count=1)
+            pubspec.write_text(txt, encoding="utf-8")
+            report.append("pubspec.yaml updated to include lesson assets.")
           else:
-            log("Skipped: error_lab_engine.dart not found")
+            report.append("WARNING: pubspec.yaml not found at ROOT; cannot add assets section.")
 
-          # B) Fix CardTheme -> CardThemeData (Flutter 3.x compatibility)
-          p = find_one("app_theme.dart")
-          if p:
-            txt = safe_read(p)
-            before = txt
-            txt = txt.replace("cardTheme: CardTheme(", "cardTheme: CardThemeData(")
-            txt = txt.replace("cardTheme: const CardTheme(", "cardTheme: const CardThemeData(")
-            if txt != before:
-              safe_write(p, txt)
-              log(f"Patched CardThemeData: {p}")
-            else:
-              log(f"No CardTheme patch needed: {p}")
-          else:
-            log("Skipped: app_theme.dart not found")
-
-          # C) Fix prompt_builder_page.dart context controller naming (common collision)
-          p = find_one("prompt_builder_page.dart")
-          if p:
-            txt = safe_read(p)
-            before = txt
-            txt = re.sub(r"\bfinal\s+context\s*=\s*TextEditingController", "final ctx = TextEditingController", txt)
-            txt = re.sub(r"\bvar\s+context\s*=\s*TextEditingController", "var ctx = TextEditingController", txt)
-            txt = re.sub(r"\bcontext\.text\b", "ctx.text", txt)
-            txt = re.sub(r"\bcontext\.dispose\(\)", "ctx.dispose()", txt)
-            txt = re.sub(r"_field\(\s*'کانتکست'\s*,\s*context\s*,", "_field('کانتکست', ctx,", txt)
-            if txt != before:
-              safe_write(p, txt)
-              log(f"Patched prompt_builder_page.dart: {p}")
-            else:
-              log(f"No prompt builder patch needed: {p}")
-          else:
-            log("Skipped: prompt_builder_page.dart not found")
-
-          # D) Replace ProgressStore with FULL API used by the app (fixes your current errors)
-          p = find_one("progress_store.dart")
-          if p:
-            new_store = textwrap.dedent("""\
-              import 'package:flutter/foundation.dart';
-
-              class ProgressStore extends ChangeNotifier {
-                bool _initialized = false;
-
-                final Set<String> completedLessons = <String>{};
-                final Map<String, int> quizScores = <String, int>{};
-
-                final List<String> _errorLogs = <String>[];
-                String _srsRaw = '{}';
-
-                Future<void> init() async {
-                  _initialized = true;
-                }
-
-                bool get isInitialized => _initialized;
-
-                // Lessons
-                bool isLessonCompleted(String lessonId) => completedLessons.contains(lessonId);
-
-                Future<void> completeLesson(String lessonId) async {
-                  completedLessons.add(lessonId);
-                  notifyListeners();
-                }
-
-                Future<void> uncompleteLesson(String lessonId) async {
-                  completedLessons.remove(lessonId);
-                  notifyListeners();
-                }
-
-                Future<Set<String>> getCompletedLessonIds() async => completedLessons;
-
-                Future<Map<String, bool>> loadLessonCompletion() async {
-                  return {for (final id in completedLessons) id: true};
-                }
-
-                // Quiz
-                Future<void> setQuizScore(String quizId, int score) async {
-                  final prev = quizScores[quizId] ?? -1;
-                  if (score > prev) {
-                    quizScores[quizId] = score;
-                    notifyListeners();
-                  }
-                }
-
-                // Error logs (Settings & Error Lab)
-                Future<void> addErrorLog(String text) async {
-                  final ts = DateTime.now().toIso8601String();
-                  _errorLogs.add('[$ts] $text');
-                  notifyListeners();
-                }
-
-                Future<List<String>> getErrorLogs() async => List<String>.unmodifiable(_errorLogs);
-
-                Future<void> clearErrorLogs() async {
-                  _errorLogs.clear();
-                  notifyListeners();
-                }
-
-                // SRS raw storage
-                Future<String> getSrsRaw() async => _srsRaw;
-
-                Future<void> setSrsRaw(String raw) async {
-                  _srsRaw = raw;
-                  notifyListeners();
-                }
-
-                // Reset all (Settings)
-                Future<void> resetAll() async {
-                  completedLessons.clear();
-                  quizScores.clear();
-                  _errorLogs.clear();
-                  _srsRaw = '{}';
-                  notifyListeners();
-                }
-              }
-            """)
-            safe_write(p, new_store)
-            log(f"Replaced ProgressStore (full): {p}")
-          else:
-            log("Skipped: progress_store.dart not found")
-
-          # E) Fix Course wrapper bug causing: Type 'Lesson' not found
-          p = find_one("course.dart")
-          if p:
-            txt = safe_read(p)
-            before = txt
-
-            # If an allLessons getter mentions Lesson, rewrite it safely (no Lesson type)
-            txt = re.sub(
-              r"List<\s*Lesson\s*>\s+get\s+allLessons\s*=>\s*[^;]*;",
-              textwrap.dedent("""\
-                List<dynamic> get allLessons {
-                  final out = <dynamic>[];
-                  for (final m in modules) {
-                    try {
-                      final lessons = (m as dynamic).lessons;
-                      if (lessons is Iterable) out.addAll(lessons);
-                    } catch (_) {}
-                  }
-                  return out;
-                }
-              """),
-              txt,
-              flags=re.S,
-            )
-
-            # If Course class doesn't exist, add a SAFE one (no Module/Lesson types)
-            if "class Course" not in txt:
-              addon = textwrap.dedent("""\
-
-                // --- AutoPatch FINAL v3: Course wrapper (kept dynamic to avoid missing types) ---
-                class Course {
-                  final String id;
-                  final String title;
-                  final List<dynamic> modules;
-
-                  const Course({
-                    required this.id,
-                    required this.title,
-                    required this.modules,
-                  });
-
-                  List<dynamic> get allLessons {
-                    final out = <dynamic>[];
-                    for (final m in modules) {
-                      try {
-                        final lessons = (m as dynamic).lessons;
-                        if (lessons is Iterable) out.addAll(lessons);
-                      } catch (_) {}
-                    }
-                    return out;
-                  }
-                }
-              """)
-              txt = txt + addon
-              log(f"Appended safe Course wrapper: {p}")
-            else:
-              # If Course exists but our previous v2 injected Lesson, ensure no Lesson remains
-              txt = txt.replace("List<Lesson> get allLessons", "List<dynamic> get allLessons")
-
-            if txt != before:
-              safe_write(p, txt)
-              log(f"Patched course.dart safely: {p}")
-            else:
-              log(f"No course.dart patch needed: {p}")
-          else:
-            log("Skipped: course.dart not found")
-
-          # F) Add ContentRepository compat methods without requiring user edits
-          p = find_one("content_repository.dart")
-          if p:
-            txt = safe_read(p)
-            if "extension ContentRepositoryCompat_FINALv3" not in txt:
-              ext = textwrap.dedent("""\
-
-                // --- AutoPatch FINAL v3: compat methods used by UI (safe/dynamic) ---
-                extension ContentRepositoryCompat_FINALv3 on ContentRepository {
-                  Future<Course> loadCourse() async {
-                    final dynamic self = this;
-
-                    // Try common loaders if they exist
-                    for (final method in ['loadModulesFa', 'loadModules', 'getModules']) {
-                      try {
-                        final mods = await self.noSuchMethod(Invocation.method(Symbol(method), []));
-                        if (mods is List) {
-                          return Course(id: 'course', title: 'PromptCraft Academy', modules: mods);
-                        }
-                      } catch (_) {}
-                    }
-
-                    return const Course(id: 'course', title: 'PromptCraft Academy', modules: <dynamic>[]);
-                  }
-
-                  Future<String> loadLessonMd(String lessonId) async {
-                    final dynamic self = this;
-                    for (final method in ['loadLessonMarkdown', 'loadLessonMd', 'getLessonMarkdown']) {
-                      try {
-                        final s = await self.noSuchMethod(Invocation.method(Symbol(method), [lessonId]));
-                        if (s is String) return s;
-                      } catch (_) {}
-                    }
-                    return 'محتوای این درس پیدا نشد (lessonId=$lessonId).';
-                  }
-                }
-              """)
-              safe_write(p, txt + ext)
-              log(f"Appended ContentRepository compat: {p}")
-            else:
-              log(f"Compat extension already present: {p}")
-          else:
-            log("Skipped: content_repository.dart not found")
-
-          # Write patch report (always)
-          rp = root / "patch_report.txt"
-          safe_write(rp, "AutoPatch FINAL v3 report - " + datetime.utcnow().isoformat() + "Z\n\n" + "\n".join(report))
-          log(f"Wrote patch_report.txt: {rp}")
-
-          log("== AutoPatch FINAL v3 done ==")
+          # 6) Write patch report
+          (root / "PATCH_REPORT.txt").write_text("\n".join(report) + "\n", encoding="utf-8")
+          print("\n".join(report))
           PY
 
-      - name: Pub get
-        working-directory: ${{ steps.root.outputs.root }}
-        run: flutter pub get
-
-      - name: Build RELEASE APKs (split per ABI + universal) + log
-        working-directory: ${{ steps.root.outputs.root }}
+      - name: Flutter pub get
         shell: bash
         run: |
-          set -o pipefail
-          flutter build apk --release --split-per-abi 2>&1 | tee flutter_build.log
-          flutter build apk --release 2>&1 | tee -a flutter_build.log
-          ls -lah build/app/outputs/flutter-apk || true
+          set -euo pipefail
+          cd "$ROOT"
+          flutter pub get
 
-      - name: Collect artifacts (always)
-        if: always()
+      - name: Build DEBUG APKs (split per ABI + universal)
         shell: bash
-        env:
-          ROOT: ${{ steps.root.outputs.root }}
         run: |
-          mkdir -p artifacts
-          cp -f "$ROOT/flutter_build.log" artifacts/flutter_build.log || true
-          cp -f "$ROOT/patch_report.txt" artifacts/patch_report.txt || true
-          cp -f "$ROOT/build/app/outputs/flutter-apk/"*.apk artifacts/ || true
-          ls -lah artifacts || true
+          set -euo pipefail
+          cd "$ROOT"
+          flutter build apk --debug --split-per-abi
+          flutter build apk --debug
 
-      - name: Upload artifacts (always)
-        if: always()
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$ROOT"
+          mkdir -p ../out
+          cp -v build/app/outputs/flutter-apk/*.apk ../out/ || true
+          cp -v PATCH_REPORT.txt ../out/ || true
+          cat > ../out/INSTALL_README.txt <<'TXT'
+          نصب روی گوشی (arm64-v8a):
+          1) فایل app-arm64-v8a-debug.apk را نصب کن.
+          2) اگر "App not installed" دیدی:
+             - نسخه قبلی اپ را کامل Uninstall کن
+             - اجازه نصب از Unknown Sources را فعال کن
+          TXT
+
+      - name: Upload APKs
         uses: actions/upload-artifact@v4
         with:
-          name: android-apk
-          path: artifacts/* 
+          name: android-apks
+          path: out 
