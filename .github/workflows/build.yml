@@ -1,4 +1,4 @@
-name: Build Android APK (ZIP + AutoPatch v2)
+name: Build Android APK (ZIP + AutoPatch v2 + Android Bootstrap)
 
 on:
   workflow_dispatch:
@@ -13,10 +13,22 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install unzip + python
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          cache: true
+
+      - name: Install unzip + python + rsync
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip python3
+          sudo apt-get install -y unzip python3 rsync
 
       - name: Pick ZIP (any name) and copy to safe.zip
         shell: bash
@@ -40,10 +52,10 @@ jobs:
           mkdir -p extracted
           unzip -q safe.zip -d extracted
           echo "Extracted:"
-          ls -lah extracted | head -n 50
+          ls -lah extracted | head -n 80
 
       - name: Find Flutter root (pubspec.yaml)
-        id: root
+        id: unpacked
         shell: bash
         run: |
           set -e
@@ -54,19 +66,36 @@ jobs:
             exit 1
           fi
           echo "root=$ROOT" >> "$GITHUB_OUTPUT"
-          echo "Project root: $ROOT"
+          echo "Unpacked root: $ROOT"
 
-      - name: Setup Java 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: "temurin"
-          java-version: "17"
+      - name: Bootstrap Android project if missing/unsupported
+        id: root
+        shell: bash
+        env:
+          ROOT: ${{ steps.unpacked.outputs.root }}
+        run: |
+          set -e
+          echo "Checking Android scaffold in: $ROOT"
 
-      - name: Setup Flutter (stable)
-        uses: subosito/flutter-action@v2
-        with:
-          channel: "stable"
-          cache: true
+          if [ -d "$ROOT/android" ] && [ -f "$ROOT/android/build.gradle" -o -f "$ROOT/android/build.gradle.kts" ]; then
+            echo "Android folder exists. Using original project."
+            echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Android folder missing or unsupported => Creating fresh Flutter Android scaffold..."
+
+          rm -rf workapp
+          flutter create -t app workapp --platforms=android --org com.promptcraft.academy
+
+          # Copy your ZIP content over the scaffold (keep generated android/)
+          rsync -a \
+            --exclude=android --exclude=ios --exclude=linux --exclude=macos --exclude=windows --exclude=web \
+            --exclude=.dart_tool --exclude=build \
+            "$ROOT"/ workapp/
+
+          echo "Using bootstrapped project: workapp"
+          echo "root=workapp" >> "$GITHUB_OUTPUT"
 
       - name: AutoPatch v2 (no code editing needed)
         shell: bash
@@ -99,38 +128,27 @@ jobs:
           if p:
             txt = safe_read(p)
             before = txt
-            # Escape patterns like '...'
             txt = re.sub(r"'(\.\.\.)'", r"\\'\1\\'", txt)
             if txt != before:
               safe_write(p, txt)
               print("Patched quotes:", p)
-            else:
-              print("No quote patch needed:", p)
-          else:
-            print("Skipped: error_lab_engine.dart not found")
 
           # 2) Fix CardTheme -> CardThemeData in app_theme.dart
           p = find_one("app_theme.dart")
           if p:
             txt = safe_read(p)
             before = txt
-            # Replace only where CardTheme is used as cardTheme value
             txt = txt.replace("cardTheme: CardTheme(", "cardTheme: CardThemeData(")
             txt = txt.replace("cardTheme: const CardTheme(", "cardTheme: const CardThemeData(")
             if txt != before:
               safe_write(p, txt)
               print("Patched CardThemeData:", p)
-            else:
-              print("No CardTheme patch needed:", p)
-          else:
-            print("Skipped: app_theme.dart not found")
 
           # 3) Fix prompt_builder_page.dart (context controller naming bug)
           p = find_one("prompt_builder_page.dart")
           if p:
             txt = safe_read(p)
             before = txt
-            # Rename controller variable `context` -> `ctx`
             txt = re.sub(r"\bfinal\s+context\s*=\s*TextEditingController", "final ctx = TextEditingController", txt)
             txt = re.sub(r"\bvar\s+context\s*=\s*TextEditingController", "var ctx = TextEditingController", txt)
             txt = re.sub(r"\bcontext\.text\b", "ctx.text", txt)
@@ -139,12 +157,8 @@ jobs:
             if txt != before:
               safe_write(p, txt)
               print("Patched prompt_builder_page.dart:", p)
-            else:
-              print("No prompt builder patch needed:", p)
-          else:
-            print("Skipped: prompt_builder_page.dart not found")
 
-          # 4) Replace ProgressStore with a compatible version (adds init + completedLessons + quizScores)
+          # 4) Replace ProgressStore with a compatible version
           p = find_one("progress_store.dart")
           if p:
             new_store = """import 'package:flutter/foundation.dart';
@@ -181,16 +195,13 @@ jobs:
               }
             }
 
-            // Extra helpers (safe)
             Future<Set<String>> getCompletedLessonIds() async => completedLessons;
           }
           """
             safe_write(p, new_store)
             print("Replaced ProgressStore:", p)
-          else:
-            print("Skipped: progress_store.dart not found")
 
-          # 5) Ensure Course type exists (append to models/course.dart if missing)
+          # 5) Ensure Course exists (append if missing)
           p = find_one("course.dart")
           if p:
             txt = safe_read(p)
@@ -215,12 +226,8 @@ jobs:
           """
               safe_write(p, txt + addon)
               print("Appended Course to:", p)
-            else:
-              print("Course already exists:", p)
-          else:
-            print("Skipped: course.dart not found")
 
-          # 6) Add compat methods to ContentRepository via extension (loadCourse + loadLessonMd)
+          # 6) Add compat methods to ContentRepository via extension
           p = find_one("content_repository.dart")
           if p:
             txt = safe_read(p)
@@ -230,19 +237,16 @@ jobs:
           // --- AutoPatch v2: compat methods used by UI ---
           extension ContentRepositoryCompat on ContentRepository {
             Future<Course> loadCourse() async {
-              // Try to use existing loadModulesFa() if present
               final dynamic self = this;
               try {
                 final modules = await self.loadModulesFa();
                 return Course(id: 'course', title: 'PromptCraft Academy', modules: (modules as List).cast<Module>());
               } catch (_) {
-                // Minimal fallback
                 return Course(id: 'course', title: 'PromptCraft Academy', modules: const <Module>[]);
               }
             }
 
             Future<String> loadLessonMd(String lessonId) async {
-              // Try to use existing loadLessonMarkdown() if present
               final dynamic self = this;
               try {
                 return await self.loadLessonMarkdown(lessonId);
@@ -254,10 +258,6 @@ jobs:
           """
               safe_write(p, txt + ext)
               print("Appended ContentRepositoryCompat:", p)
-            else:
-              print("ContentRepositoryCompat already exists:", p)
-          else:
-            print("Skipped: content_repository.dart not found")
 
           print("== AutoPatch v2 done ==")
           PY
