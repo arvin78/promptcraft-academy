@@ -1,0 +1,143 @@
+name: Build Android APK (v8a) from ZIP
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Find ZIP + unzip + find Flutter root
+        id: prep
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 1) Pick ZIP (fixed name to avoid picking the wrong file)
+          # Put EXACTLY ONE ZIP in the repo root named: source.zip
+          ZIP="source.zip"
+          if [ ! -f "$ZIP" ]; then
+            echo "ERROR: source.zip not found in repo root." >&2
+            echo "Fix: delete old zips and upload your project zip renamed to source.zip" >&2
+            echo "Files in repo root:" >&2
+            ls -la >&2
+            exit 1
+          fi
+          echo "ZIP=$ZIP"
+
+          # 2) Unzip
+          rm -rf src_unzipped
+          mkdir -p src_unzipped
+          unzip -q "$ZIP" -d src_unzipped
+
+          # 3) Find pubspec.yaml (Flutter project root)
+          PUBSPEC="$(find src_unzipped -type f -name pubspec.yaml -print -quit)"
+          if [ -z "$PUBSPEC" ]; then
+            echo "pubspec.yaml not found inside ZIP." >&2
+            exit 1
+          fi
+          ROOT="$(dirname "$PUBSPEC")"
+          echo "ROOT=$ROOT"
+
+          # outputs
+          {
+            echo "zip_file=$ZIP"
+            echo "project_root=$ROOT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Flutter (stable)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.22.3"
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        working-directory: ${{ steps.prep.outputs.project_root }}
+        run: flutter pub get
+
+      - name: Ensure Android platform exists (auto-create if missing)
+        working-directory: ${{ steps.prep.outputs.project_root }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.promptcraft.academy .
+          fi
+
+      - name: Build APKs (debug + split per ABI) and save logs
+        id: build
+        working-directory: ${{ steps.prep.outputs.project_root }}
+        shell: bash
+        run: |
+          set -o pipefail
+          : > "$GITHUB_WORKSPACE/flutter_build.log"
+          flutter build apk --debug --split-per-abi -v 2>&1 | tee -a "$GITHUB_WORKSPACE/flutter_build.log"
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Create ERROR_SUMMARY.txt (always)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f flutter_build.log ]; then
+            echo "No flutter_build.log found." > ERROR_SUMMARY.txt
+            exit 0
+          fi
+          {
+            echo "Filtered error-like lines (last 120 matches):"
+            grep -E "FAILURE:|\bException\b|\berror:\b|\bError:\b|BUILD FAILED|Gradle task" flutter_build.log | tail -n 120 || true
+            echo ""
+            echo "---- last 200 lines ----"
+            tail -n 200 flutter_build.log || true
+          } > ERROR_SUMMARY.txt
+
+      - name: Collect artifacts (APK + logs)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="${{ steps.prep.outputs.project_root }}"
+          mkdir -p artifact
+          cp -f flutter_build.log ERROR_SUMMARY.txt artifact/ 2>/dev/null || true
+
+          if [ -d "$ROOT/build/app/outputs/flutter-apk" ]; then
+            find "$ROOT/build/app/outputs/flutter-apk" -maxdepth 1 -type f -name "*.apk" -print -exec cp -f {} artifact/ \; || true
+          fi
+
+          # include pubspec for debugging
+          if [ -f "$ROOT/pubspec.yaml" ]; then
+            cp -f "$ROOT/pubspec.yaml" artifact/
+          fi
+
+      - name: Upload artifact (android-build)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: artifact
+
+      - name: Final status (no hard-fail)
+        if: always()
+        shell: bash
+        run: |
+          code="${{ steps.build.outputs.exit_code }}"
+          if [ "$code" != "0" ]; then
+            echo "::warning::Flutter build FAILED (exit code $code). Download artifact android-build and read ERROR_SUMMARY.txt + flutter_build.log."
+          else
+            echo "✅ Build OK. Install: app-arm64-v8a-debug.apk (inside android-build artifact)."
+          fi
